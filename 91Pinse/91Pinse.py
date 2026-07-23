@@ -2,7 +2,7 @@
 """
 脚本名称: 91Pinse 爬虫（基于原 91Porn 脚本改造）
 用途: 从 91pinse.com 列表页爬取视频标题、视频下载直链、封面图直链和唯一标识，
-并按 crawler.v1 协议输出给后端入库。
+并按 crawler.v2 协议输出给后端入库。
 
 说明:
  - 默认从 https://91pinse.com/v/hot/ 热门列表抓取视频
@@ -85,7 +85,7 @@ MAX_PAGES = None
 RESUME = True
 MAX_EMPTY_PAGES = 2
 CRAWLER_NAME = "91Pinse"
-CRAWLER_PROTOCOL = "crawler.v1"
+CRAWLER_PROTOCOL = "crawler.v2"
 
 
 def crawler_source_id(raw: str) -> str:
@@ -158,6 +158,10 @@ class PinseSpider:
         self.job_mode = bool(job_mode)
         self.emitted = 0
         self.checked = 0
+        self.limits = {}
+        self._last_progress_at = time.monotonic()
+        self._start_monotonic = time.monotonic()
+        self._last_item_at = time.monotonic()
         if proxies:
             self.session.proxies.update(proxies)
 
@@ -235,24 +239,76 @@ class PinseSpider:
             return self.emitted >= budget
         return self.processed_videos >= budget
 
+    def _deadline_reached(self) -> bool:
+        limits = self.limits or {}
+        max_runtime = limits.get("max_runtime_seconds")
+        if max_runtime:
+            try:
+                if time.monotonic() - self._start_monotonic >= float(max_runtime):
+                    return True
+            except (TypeError, ValueError):
+                pass
+        deadline_at = limits.get("deadline_at")
+        if deadline_at:
+            try:
+                text = str(deadline_at).replace("Z", "+00:00")
+                deadline = datetime.fromisoformat(text)
+                if deadline.tzinfo is None:
+                    return datetime.utcnow() >= deadline
+                from datetime import timezone
+                return datetime.now(timezone.utc) >= deadline.astimezone(timezone.utc)
+            except Exception:
+                pass
+        idle = limits.get("candidate_idle_timeout_seconds")
+        if idle:
+            try:
+                anchor = self._last_item_at if self.emitted > 0 else self._start_monotonic
+                if time.monotonic() - anchor >= float(idle):
+                    return True
+            except (TypeError, ValueError):
+                pass
+        return False
+
+    def _maybe_progress(self, message: str = ""):
+        if not self.stream_output:
+            return
+        interval = 60
+        try:
+            interval = int((self.limits or {}).get("progress_interval_seconds") or 60)
+        except (TypeError, ValueError):
+            interval = 60
+        if interval <= 0:
+            interval = 60
+        now = time.monotonic()
+        if now - self._last_progress_at < interval and not message:
+            return
+        write_jsonl({
+            "type": "progress",
+            "checked": self.checked,
+            "emitted": self.emitted,
+            "message": message or f"checked={self.checked} emitted={self.emitted}",
+        })
+        self._last_progress_at = now
+
     def emit_stream_video(self, video: dict) -> bool:
         if not self.stream_output:
             return False
         try:
-            if self.stream_protocol == "crawler.v1":
+            if self.stream_protocol == "crawler.v2":
                 source_id = crawler_source_id(video.get("source_id") or video.get("viewkey") or "")
                 media_url = video.get("video_url") or ""
-                if not source_id or not media_url:
+                title = (video.get("title") or "").strip()
+                if not source_id or not media_url or not title:
                     self.log(
                         f"[stream] skip invalid item: source_id={source_id!r} "
-                        f"media_url={bool(media_url)}"
+                        f"media_url={bool(media_url)} title={bool(title)}"
                     )
                     return False
                 referer = video.get("detail_url") or self.base_url
                 event = {
                     "type": "item",
                     "source_id": source_id,
-                    "title": video.get("title") or "",
+                    "title": title,
                     "media_url": media_url,
                     "thumbnail_url": video.get("thumb_url") or "",
                     "detail_url": video.get("detail_url") or "",
@@ -265,6 +321,8 @@ class PinseSpider:
                 if quality:
                     event["quality"] = quality
                 write_jsonl(event)
+                self._last_item_at = time.monotonic()
+                self._last_progress_at = time.monotonic()
                 return True
             write_jsonl(video)
             return True
@@ -293,26 +351,114 @@ class PinseSpider:
         match = re.search(r"/v/(\d+)", urlparse(url or "").path)
         return match.group(1) if match else ""
 
+    def _extract_playback_api_url(self, html_text: str, detail_url: str = "") -> str:
+        """Extract current-site playback API path from detail page."""
+        patterns = (
+            r"playbackApiUrl\s*=\s*['\"]([^'\"]+)['\"]",
+            r"__jjPlaybackSourceRequest\s*=\s*\{[\s\S]*?url:\s*['\"]([^'\"]+)['\"]",
+            r"['\"](/api/videos/\d+/playback)['\"]",
+        )
+        for pat in patterns:
+            match = re.search(pat, html_text or "")
+            if not match:
+                continue
+            path = match.group(1).strip()
+            if not path:
+                continue
+            if path.startswith("http"):
+                return path
+            return urljoin(self.site + "/", path.lstrip("/"))
+
+        post_id = self._extract_post_id(detail_url)
+        if post_id:
+            return f"{self.site}/api/videos/{post_id}/playback"
+        return ""
+
+    def _fetch_playback_api_urls(self, api_url: str, referer: str = "") -> list:
+        """POST /api/videos/{id}/playback and collect stream candidates."""
+        if not api_url:
+            return []
+        headers = {
+            "User-Agent": HEADERS["User-Agent"],
+            "Accept": "application/json, text/plain, */*",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": referer or self.base_url,
+            "Origin": self.site,
+        }
+        try:
+            response = self.session.post(
+                api_url,
+                headers=headers,
+                timeout=20,
+                data=b"",
+            )
+            if response.status_code != 200:
+                self.log(
+                    f"  playback API status={response.status_code} url={api_url}"
+                )
+                return []
+            data = response.json()
+        except Exception as e:
+            self.log(f"  playback API failed: {e}")
+            return []
+
+        urls = []
+        if isinstance(data, dict):
+            for key in ("url", "fallback_url", "media_url", "src"):
+                value = str(data.get(key) or "").strip()
+                if value.startswith("http"):
+                    urls.append(value)
+            nested = data.get("data")
+            if isinstance(nested, dict):
+                for key in ("url", "fallback_url", "media_url", "src"):
+                    value = str(nested.get(key) or "").strip()
+                    if value.startswith("http"):
+                        urls.append(value)
+        elif isinstance(data, str) and data.startswith("http"):
+            urls.append(data)
+
+        # de-dup preserve order
+        seen = set()
+        ordered = []
+        for url in urls:
+            if url not in seen:
+                seen.add(url)
+                ordered.append(url)
+        return ordered
+
     def _extract_embedded_video_urls(self, html_text: str) -> list:
         urls = []
         seen = set()
+
+        def add(url: str):
+            value = (url or "").strip()
+            if (
+                value.startswith("http")
+                and (".m3u8" in value or ".mp4" in value.lower())
+                and value not in seen
+            ):
+                seen.add(value)
+                urls.append(value)
+
         for script_match in re.finditer(r"<script[^>]*>([\s\S]*?)</script>", html_text):
             body = script_match.group(1)
-            if "loadSource" not in body or "atob" not in body:
-                continue
-            for encoded_match in re.finditer(r"'(aHR0c[^']+)'", body):
-                encoded = encoded_match.group(1).replace("\\u003D", "=")
-                try:
-                    url = base64.b64decode(encoded).decode("utf-8").strip()
-                except Exception:
-                    continue
-                if (
-                    url.startswith("http")
-                    and (".m3u8" in url or ".mp4" in url.lower())
-                    and url not in seen
-                ):
-                    seen.add(url)
-                    urls.append(url)
+            # New site may not use atob; still try base64 payloads when present.
+            if "atob" in body or "loadSource" in body or "aHR0c" in body:
+                for encoded_match in re.finditer(r"['\"](aHR0c[^'\"]+)['\"]", body):
+                    encoded = encoded_match.group(1).replace("\\u003D", "=")
+                    try:
+                        url = base64.b64decode(encoded).decode("utf-8").strip()
+                    except Exception:
+                        continue
+                    add(url)
+
+            for match in re.finditer(
+                r"https?://[^\s\"'<>]+\.(?:m3u8|mp4)[^\s\"'<>]*",
+                body,
+                re.I,
+            ):
+                add(match.group(0))
+
         return urls
 
     def _normalize_pinse_stream_url(self, url: str) -> str:
@@ -656,7 +802,7 @@ class PinseSpider:
         text = re.sub(r'\s+', ' ', text).strip()
         return html.unescape(text)[:120]
 
-    def parse_detail_page(self, html: str, referer: str = "") -> dict:
+    def parse_detail_page(self, html: str, referer: str = "", detail_url: str = "") -> dict:
         result = {}
 
         if not html:
@@ -667,9 +813,17 @@ class PinseSpider:
             result["title"] = title
 
         candidates = self._collect_video_url_candidates(html)
+
+        # Current 91pinse pages load streams via POST /api/videos/{id}/playback
+        api_url = self._extract_playback_api_url(html, detail_url=detail_url or referer)
+        if api_url:
+            for url in self._fetch_playback_api_urls(api_url, referer=detail_url or referer):
+                if url not in candidates:
+                    candidates.append(url)
+
         video_url, quality = self._select_highest_quality_url(
             candidates,
-            referer or self.base_url,
+            referer or detail_url or self.base_url,
         )
         if video_url:
             result["video_url"] = video_url
@@ -757,6 +911,9 @@ class PinseSpider:
             if self._reached_output_budget():
                 self.log(f"已输出 {self.emitted if self.stream_output else self.processed_videos} 个候选，达到上限，停止")
                 break
+            if self._deadline_reached():
+                self.log("达到 job limits 截止条件，停止")
+                break
 
             page_url = self.build_list_url(page_num)
 
@@ -796,13 +953,7 @@ class PinseSpider:
             if new_videos:
                 self._process_video_list(new_videos, referer=page_url)
             self.pages_crawled += 1
-            if self.stream_output:
-                write_jsonl({
-                    "type": "progress",
-                    "checked": self.checked,
-                    "emitted": self.emitted,
-                    "message": f"Scanning page {page_num}",
-                })
+            self._maybe_progress(f"Scanning page {page_num}")
             page_num += 1
             crawled_in_session += 1
 
@@ -814,10 +965,13 @@ class PinseSpider:
         for idx, video in enumerate(videos, 1):
             if self._reached_output_budget():
                 return
+            if self._deadline_reached():
+                return
             if self._is_seen(video):
                 self.log(f"  [SKIP] 已处理过: {video.get('source_id') or video['viewkey']}")
                 self.skipped_videos += 1
                 self.checked += 1
+                self._maybe_progress()
                 continue
 
             self.checked += 1
@@ -839,6 +993,7 @@ class PinseSpider:
             detail_info = self.parse_detail_page(
                 detail_html,
                 referer=video["detail_url"],
+                detail_url=video["detail_url"],
             )
 
             if detail_info.get("video_url"):
@@ -876,6 +1031,7 @@ class PinseSpider:
                 self.log(f"  [OK] 成功提取视频直链")
                 if self.emit_stream_video(video):
                     self.emitted += 1
+                self._maybe_progress()
                 if self._reached_output_budget():
                     return
             else:
@@ -884,6 +1040,7 @@ class PinseSpider:
                 self.results.append(video)
                 self.skip_viewkeys.add(video['viewkey'])
                 self.failed_videos += 1
+                self._maybe_progress()
 
     def _save_results(self):
         output_data = {
@@ -1029,10 +1186,11 @@ def run_job(job_path: str):
         candidate_budget=candidate_budget,
         seen_viewkeys=seen_source_ids,
         stream_output=True,
-        stream_protocol="crawler.v1",
+        stream_protocol="crawler.v2",
         proxies=proxies,
         job_mode=True,
     )
+    spider.limits = job.get("limits") if isinstance(job.get("limits"), dict) else {}
     try:
         spider.crawl()
         write_jsonl({
@@ -1075,7 +1233,7 @@ def main():
     parser.add_argument("--stream-output", action="store_true",
                         help="流式模式：每解析一条视频直链就立即把它作为一行 JSON 写到 stdout 并 flush；日志改走 stderr。")
     parser.add_argument("--job", type=str, default=None,
-                        help="crawler.v1 job JSON 路径；作为通用脚本爬虫运行。")
+                        help="crawler.v2 job JSON 路径；作为通用脚本爬虫运行。")
 
     args = parser.parse_args()
     if args.job:

@@ -5,12 +5,15 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.parse
+from datetime import datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup
 
 CRAWLER_NAME = "BaddiesOnly"
+CRAWLER_PROTOCOL = "crawler.v2"
 
 HOST = "https://baddiesonly.tv"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
@@ -136,13 +139,54 @@ def parse_list_page(html):
 
 
 def emit(event):
-    sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    try:
+        sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        sys.exit(0)
 
 
 def log(msg, *args):
     line = msg % args if args else msg
     print(line, file=sys.stderr, flush=True)
+
+
+def positive_int(value, default=10):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def deadline_reached(limits, start_mono, last_item_mono, emitted):
+    limits = limits or {}
+    max_runtime = limits.get("max_runtime_seconds")
+    if max_runtime:
+        try:
+            if time.monotonic() - start_mono >= float(max_runtime):
+                return True
+        except (TypeError, ValueError):
+            pass
+    deadline_at = limits.get("deadline_at")
+    if deadline_at:
+        try:
+            text = str(deadline_at).replace("Z", "+00:00")
+            deadline = datetime.fromisoformat(text)
+            if deadline.tzinfo is None:
+                return datetime.utcnow() >= deadline
+            return datetime.now(timezone.utc) >= deadline.astimezone(timezone.utc)
+        except Exception:
+            pass
+    idle = limits.get("candidate_idle_timeout_seconds")
+    if idle:
+        try:
+            anchor = last_item_mono if emitted > 0 else start_mono
+            if time.monotonic() - anchor >= float(idle):
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
 
 
 def main():
@@ -151,32 +195,33 @@ def main():
     args = parser.parse_args()
 
     try:
-        with open(args.job, "r") as f:
+        with open(args.job, "r", encoding="utf-8") as f:
             job = json.load(f)
     except Exception as e:
         log("Failed to load job file: %s", e)
         sys.exit(1)
 
-    candidate_budget = (
-        job.get("candidate_budget")
-        or job.get("target_new")
-        or 10
+    if job.get("protocol") != CRAWLER_PROTOCOL:
+        log("Unsupported protocol: %r (need %r)", job.get("protocol"), CRAWLER_PROTOCOL)
+        sys.exit(1)
+    if job.get("mode") not in ("", None, "crawl"):
+        log("Unsupported mode: %r", job.get("mode"))
+        sys.exit(1)
+
+    candidate_budget = positive_int(
+        job.get("candidate_budget") or job.get("target_new"),
+        default=10,
     )
-    try:
-        candidate_budget = int(candidate_budget)
-        if candidate_budget <= 0:
-            candidate_budget = 10
-    except (ValueError, TypeError):
-        candidate_budget = 10
 
     seen_file = job.get("seen_source_ids_file", "")
-    output_dir = job.get("output_dir", "/tmp")
-    proxy_url = job.get("network", {}).get("proxy_url", "")
+    proxy_url = (job.get("network") or {}).get("proxy_url", "")
+    limits = job.get("limits") if isinstance(job.get("limits"), dict) else {}
+    progress_interval = positive_int(limits.get("progress_interval_seconds"), default=60)
 
     seen_ids = set()
     if seen_file and os.path.isfile(seen_file):
         try:
-            with open(seen_file, "r") as f:
+            with open(seen_file, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line:
@@ -193,14 +238,34 @@ def main():
     session = requests.Session()
     checked = 0
     emitted = 0
+    start_mono = time.monotonic()
+    last_item_mono = start_mono
+    last_progress_mono = start_mono
+
+    def maybe_progress(message=""):
+        nonlocal last_progress_mono
+        now = time.monotonic()
+        if not message and now - last_progress_mono < progress_interval:
+            return
+        emit({
+            "type": "progress",
+            "checked": checked,
+            "emitted": emitted,
+            "message": message or f"checked={checked} emitted={emitted}",
+        })
+        last_progress_mono = now
 
     try:
         for cat in CATEGORIES:
-            if emitted >= candidate_budget:
+            if emitted >= candidate_budget or deadline_reached(limits, start_mono, last_item_mono, emitted):
                 break
 
             page = 1
             while emitted < candidate_budget:
+                if deadline_reached(limits, start_mono, last_item_mono, emitted):
+                    log("Reached job deadline/limits, stopping")
+                    break
+
                 url = f"{HOST}/{cat}/{page}/"
                 log("Fetching %s", url)
 
@@ -228,17 +293,23 @@ def main():
                 for item in items:
                     if emitted >= candidate_budget:
                         break
+                    if deadline_reached(limits, start_mono, last_item_mono, emitted):
+                        break
 
                     checked += 1
                     source_id = sanitize_source_id(item["id"])
+                    if not source_id:
+                        continue
 
                     if source_id in seen_ids:
                         log("Skipping seen source_id=%s", source_id)
+                        maybe_progress()
                         continue
 
                     detail_url = f"{HOST}/videos/{item['id']}/{item['slug']}/"
+                    title = (item.get("title") or "").strip() or "Video"
 
-                    log("Fetching detail for vid=%s title=%s", source_id, item["title"][:50])
+                    log("Fetching detail for vid=%s title=%s", source_id, title[:50])
                     try:
                         detail_resp = session.get(
                             detail_url,
@@ -249,17 +320,19 @@ def main():
                         detail_html = detail_resp.text if detail_resp.status_code == 200 else ""
                     except requests.RequestException as e:
                         log("Failed to fetch detail for %s: %s", source_id, e)
+                        maybe_progress()
                         continue
 
                     media_url = extract_media_url(detail_html) if detail_html else ""
                     if not media_url:
                         log("No media_url found for vid=%s, skipping", source_id)
+                        maybe_progress()
                         continue
 
                     event = {
                         "type": "item",
                         "source_id": source_id,
-                        "title": item["title"],
+                        "title": title,
                         "media_url": media_url,
                         "thumbnail_url": item["pic"],
                         "detail_url": detail_url,
@@ -271,13 +344,11 @@ def main():
 
                     emit(event)
                     emitted += 1
+                    seen_ids.add(source_id)
+                    last_item_mono = time.monotonic()
+                    last_progress_mono = last_item_mono
 
-                emit({
-                    "type": "progress",
-                    "checked": checked,
-                    "emitted": emitted,
-                    "message": f"Scanned {cat} page {page}",
-                })
+                maybe_progress(f"Scanned {cat} page {page}")
 
                 if len(items) < ITEM_LIMIT:
                     break
@@ -296,7 +367,6 @@ def main():
         log("Interrupted by user")
         sys.exit(0)
     except BrokenPipeError:
-        log("Broken pipe")
         sys.exit(0)
 
 

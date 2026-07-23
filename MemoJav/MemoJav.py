@@ -2,12 +2,15 @@
 # -*- coding: utf-8 -*-
 
 CRAWLER_NAME = "MemoJav"
+CRAWLER_PROTOCOL = "crawler.v2"
 
-import sys
+import argparse
 import json
 import os
 import re
+import sys
 import time
+from datetime import datetime, timezone
 from urllib.parse import urljoin
 
 import requests
@@ -25,9 +28,6 @@ CLASSES = [
     {"type_id": "categories/milf", "type_name": "MILF"},
 ]
 
-# ---------------------------------------------------------------------
-# Helpers (不变)
-# ---------------------------------------------------------------------
 
 def format_pic(pic):
     if not pic:
@@ -40,14 +40,62 @@ def format_pic(pic):
         return HOST + pic
     return HOST + "/" + pic
 
-def clean_text(html):
-    if not html:
+
+def sanitize_source_id(raw):
+    sanitized = re.sub(r"[^a-zA-Z0-9_.-]", "", str(raw or ""))
+    if not re.search(r"[A-Za-z0-9]", sanitized):
         return ""
-    t = str(html)
-    t = re.sub(r"<[^>]+>", "", t)
-    t = t.replace("/", " ")
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
+    return sanitized[:160]
+
+
+def emit(event):
+    try:
+        print(json.dumps(event, ensure_ascii=False), flush=True)
+    except BrokenPipeError:
+        sys.exit(0)
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def positive_int(value, default=10):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def deadline_reached(limits, start_mono, last_item_mono, emitted):
+    limits = limits or {}
+    max_runtime = limits.get("max_runtime_seconds")
+    if max_runtime:
+        try:
+            if time.monotonic() - start_mono >= float(max_runtime):
+                return True
+        except (TypeError, ValueError):
+            pass
+    deadline_at = limits.get("deadline_at")
+    if deadline_at:
+        try:
+            text = str(deadline_at).replace("Z", "+00:00")
+            deadline = datetime.fromisoformat(text)
+            if deadline.tzinfo is None:
+                return datetime.utcnow() >= deadline
+            return datetime.now(timezone.utc) >= deadline.astimezone(timezone.utc)
+        except Exception:
+            pass
+    idle = limits.get("candidate_idle_timeout_seconds")
+    if idle:
+        try:
+            anchor = last_item_mono if emitted > 0 else start_mono
+            if time.monotonic() - anchor >= float(idle):
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
 
 def fetch_html(url, session, retries=3):
     if not url.startswith("http"):
@@ -63,8 +111,9 @@ def fetch_html(url, session, retries=3):
             last_err = e
             time.sleep(1)
 
-    sys.stderr.write(f"[MemoJav] HTTP failed for {url}: {last_err}\n")
+    log(f"[MemoJav] HTTP failed for {url}: {last_err}")
     return ""
+
 
 def parse_list(html, limit=20):
     if not html:
@@ -83,8 +132,8 @@ def parse_list(html, limit=20):
         if not m:
             continue
 
-        vod_id = m.group(1).upper()
-        if vod_id in seen:
+        vod_id = sanitize_source_id(m.group(1).upper())
+        if not vod_id or vod_id in seen:
             continue
         seen.add(vod_id)
 
@@ -108,12 +157,13 @@ def parse_list(html, limit=20):
 
     return items
 
+
 def parse_page_count(html, default=1):
     if not html:
         return default
 
     cur = default
-    m = re.search(r'pageNav-page--current[^>]*>.*?page-(\d+)', html)
+    m = re.search(r"pageNav-page--current[^>]*>.*?page-(\d+)", html)
     if m:
         cur = int(m.group(1))
 
@@ -125,49 +175,48 @@ def parse_page_count(html, default=1):
             max_page = n
     return max_page or 1
 
-# ---------------------------------------------------------------------
-# Main – 只爬 MILF
-# ---------------------------------------------------------------------
 
 def main():
-    if len(sys.argv) != 3 or sys.argv[1] != "--job":
-        sys.stderr.write("Usage: python3 crawler.py --job /path/to/job.json\n")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="MemoJav crawler")
+    parser.add_argument("--job", required=True, help="Path to job.json")
+    args = parser.parse_args()
 
-    job_path = sys.argv[2]
     try:
-        with open(job_path, "r") as f:
+        with open(args.job, "r", encoding="utf-8") as f:
             job = json.load(f)
     except Exception as e:
-        sys.stderr.write(f"Failed to load job.json: {e}\n")
+        log(f"Failed to load job.json: {e}")
         sys.exit(1)
 
-    # Candidate budget
-    candidate_budget = job.get("candidate_budget") or job.get("target_new") or 10
-    try:
-        candidate_budget = int(candidate_budget)
-    except Exception:
-        candidate_budget = 10
-    if candidate_budget <= 0:
-        candidate_budget = 10
+    if job.get("protocol") != CRAWLER_PROTOCOL:
+        log(f"Unsupported protocol: {job.get('protocol')!r} (need {CRAWLER_PROTOCOL!r})")
+        sys.exit(1)
+    if job.get("mode") not in ("", None, "crawl"):
+        log(f"Unsupported mode: {job.get('mode')!r}")
+        sys.exit(1)
 
-    # Seen set
+    candidate_budget = positive_int(
+        job.get("candidate_budget") or job.get("target_new"),
+        default=10,
+    )
+
     seen_file = job.get("seen_source_ids_file")
     seen = set()
     if seen_file and os.path.exists(seen_file):
-        with open(seen_file, "r") as f:
+        with open(seen_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if line:
                     seen.add(line)
 
-    # Proxy
-    proxy_url = job.get("network", {}).get("proxy_url")
+    proxy_url = (job.get("network") or {}).get("proxy_url")
     proxies = None
     if proxy_url:
         proxies = {"http": proxy_url, "https": proxy_url}
 
-    # Session
+    limits = job.get("limits") if isinstance(job.get("limits"), dict) else {}
+    progress_interval = positive_int(limits.get("progress_interval_seconds"), default=60)
+
     session = requests.Session()
     session.headers.update({"User-Agent": UA, "Referer": HOST + "/"})
     if proxies:
@@ -176,10 +225,29 @@ def main():
     emitted = 0
     emitted_ids = set()
     checked_total = 0
+    start_mono = time.monotonic()
+    last_item_mono = start_mono
+    last_progress_mono = start_mono
+
+    def maybe_progress(message=""):
+        nonlocal last_progress_mono
+        now = time.monotonic()
+        if not message and now - last_progress_mono < progress_interval:
+            return
+        emit({
+            "type": "progress",
+            "checked": checked_total,
+            "emitted": emitted,
+            "message": message or f"checked={checked_total} emitted={emitted}",
+        })
+        last_progress_mono = now
 
     def emit_item(video):
-        nonlocal emitted
-        source_id = video["vod_id"]
+        nonlocal emitted, last_item_mono, last_progress_mono
+        source_id = sanitize_source_id(video["vod_id"])
+        title = (video.get("vod_name") or "").strip()
+        if not source_id or not title:
+            return
 
         if source_id in seen or source_id in emitted_ids:
             return
@@ -187,7 +255,7 @@ def main():
         item = {
             "type": "item",
             "source_id": source_id,
-            "title": video["vod_name"],
+            "title": title,
             "media_url": (
                 f"https://video10.memojav.net/stream/{source_id.upper()}/master.m3u8"
             ),
@@ -207,20 +275,23 @@ def main():
                 if actress:
                     item["author"] = actress
 
-        print(json.dumps(item, ensure_ascii=False), flush=True)
+        emit(item)
         emitted += 1
         emitted_ids.add(source_id)
+        last_item_mono = time.monotonic()
+        last_progress_mono = last_item_mono
 
-    # 只爬 MILF 分类
-    target = CLASSES[0]  # {"type_id": "categories/milf", ...}
+    target = CLASSES[0]
     tid = target["type_id"]
     pg = 1
 
     while True:
         if emitted >= candidate_budget:
             break
+        if deadline_reached(limits, start_mono, last_item_mono, emitted):
+            log("Reached job deadline/limits, stopping")
+            break
 
-        # 构建 URL（和原逻辑一致）
         if tid == "best":
             url = "/best/" if pg == 1 else f"/best/page-{pg}"
         else:
@@ -238,30 +309,35 @@ def main():
             checked_total += 1
             if v["vod_id"] not in seen and v["vod_id"] not in emitted_ids:
                 emit_item(v)
+            maybe_progress()
             if emitted >= candidate_budget:
                 break
+            if deadline_reached(limits, start_mono, last_item_mono, emitted):
+                break
 
+        maybe_progress(f"Scanned {tid} page {pg}")
         page_count = parse_page_count(html, pg)
         if pg >= page_count:
             break
         pg += 1
 
-    # Done event
-    done = {
+    emit({
         "type": "done",
         "stats": {
             "checked": checked_total,
             "emitted": emitted,
         },
-    }
-    print(json.dumps(done, ensure_ascii=False), flush=True)
+    })
+
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        sys.stderr.write("Interrupted by user\n")
-        sys.exit(130)
+        log("Interrupted by user")
+        sys.exit(0)
     except BrokenPipeError:
-        sys.stderr.write("Broken pipe, exiting\n")
+        sys.exit(0)
+    except Exception as e:
+        log(f"Fatal error: {e}")
         sys.exit(1)

@@ -2,7 +2,7 @@
 """
 脚本名称: 91Porn
 用途: 爬取 91Porn 列表中的视频标题、视频下载直链、封面图直链和唯一标识，
-并按 crawler.v1 协议输出给 video-site-91 后端入库。
+并按 crawler.v2 协议输出给 video-site-91 后端入库。
 
 默认抓取热门分类(category=top)。
 CLI 参数 --category 可用于指定单个分类（例如 "top"、"new" 等）。
@@ -89,7 +89,7 @@ MAX_PAGES = None
 RESUME = True
 MAX_EMPTY_PAGES = 2
 CRAWLER_NAME = "91Porn"
-CRAWLER_PROTOCOL = "crawler.v1"
+CRAWLER_PROTOCOL = "crawler.v2"
 
 
 def crawler_source_id(raw: str) -> str:
@@ -101,7 +101,10 @@ def crawler_source_id(raw: str) -> str:
 
 
 def write_jsonl(event: dict):
-    print(json.dumps(event, ensure_ascii=False), flush=True)
+    try:
+        print(json.dumps(event, ensure_ascii=False), flush=True)
+    except BrokenPipeError:
+        sys.exit(0)
 
 
 def positive_int(*values, default: int) -> int:
@@ -170,7 +173,13 @@ class Porn91Spider:
         self.processed_videos = 0
         self.skipped_videos = 0
         self.failed_videos = 0
+        self.checked = 0
+        self.emitted = 0
         self.skip_viewkeys = set()
+        self._last_progress_at = time.monotonic()
+        self._start_monotonic = time.monotonic()
+        self._last_item_at = time.monotonic()
+        self.limits = {}
 
         if seen_viewkeys:
             for vk in seen_viewkeys:
@@ -204,34 +213,104 @@ class Porn91Spider:
         else:
             print(line)
 
-    def emit_stream_video(self, video: dict):
+    def _deadline_reached(self) -> bool:
+        limits = self.limits or {}
+        max_runtime = limits.get("max_runtime_seconds")
+        if max_runtime:
+            try:
+                if time.monotonic() - self._start_monotonic >= float(max_runtime):
+                    return True
+            except (TypeError, ValueError):
+                pass
+        deadline_at = limits.get("deadline_at")
+        if deadline_at:
+            try:
+                # Accept trailing Z
+                text = str(deadline_at).replace("Z", "+00:00")
+                deadline = datetime.fromisoformat(text)
+                if deadline.tzinfo is None:
+                    now = datetime.utcnow()
+                    return now >= deadline
+                from datetime import timezone
+                return datetime.now(timezone.utc) >= deadline.astimezone(timezone.utc)
+            except Exception:
+                pass
+        idle = limits.get("candidate_idle_timeout_seconds")
+        if idle and self.emitted == 0:
+            try:
+                if time.monotonic() - self._start_monotonic >= float(idle):
+                    return True
+            except (TypeError, ValueError):
+                pass
+        if idle and self.emitted > 0:
+            try:
+                if time.monotonic() - self._last_item_at >= float(idle):
+                    return True
+            except (TypeError, ValueError):
+                pass
+        return False
+
+    def _maybe_progress(self, message: str = ""):
         if not self.stream_output:
             return
+        interval = 60
         try:
-            if self.stream_protocol == "crawler.v1":
+            interval = int((self.limits or {}).get("progress_interval_seconds") or 60)
+        except (TypeError, ValueError):
+            interval = 60
+        if interval <= 0:
+            interval = 60
+        now = time.monotonic()
+        if now - self._last_progress_at < interval and not message:
+            return
+        write_jsonl({
+            "type": "progress",
+            "checked": self.checked,
+            "emitted": self.emitted,
+            "message": message or f"checked={self.checked} emitted={self.emitted}",
+        })
+        self._last_progress_at = now
+
+    def emit_stream_video(self, video: dict) -> bool:
+        if not self.stream_output:
+            return False
+        try:
+            if self.stream_protocol == "crawler.v2":
                 source_id = crawler_source_id(video.get("source_id") or video.get("viewkey") or "")
-                item = {
-                    "title": video.get("title") or "",
+                media_url = video.get("video_url") or ""
+                title = (video.get("title") or "").strip()
+                if not source_id or not media_url or not title:
+                    self.log(
+                        f"[stream] skip invalid item: source_id={source_id!r} "
+                        f"media_url={bool(media_url)} title={bool(title)}"
+                    )
+                    return False
+                event = {
+                    "type": "item",
+                    "source_id": source_id,
+                    "title": title,
                     "detail_url": video.get("detail_url") or "",
                     "author": "91porn",
                     "tags": ["91porn"],
-                    "media_url": video.get("video_url") or "",
+                    "media_url": media_url,
                     "thumbnail_url": video.get("thumb_url") or "",
                     "headers": {
                         "Referer": video.get("detail_url") or BASE_URL,
+                        "User-Agent": HEADERS["User-Agent"],
                     },
                 }
-                if source_id:
-                    item["source_id"] = source_id
-                event = {
-                    "type": "item",
-                    "item": item,
-                }
                 write_jsonl(event)
-            else:
-                print(json.dumps(video, ensure_ascii=False), flush=True)
+                self.emitted += 1
+                self._last_item_at = time.monotonic()
+                self._last_progress_at = time.monotonic()
+                return True
+            write_jsonl(video)
+            return True
+        except BrokenPipeError:
+            sys.exit(0)
         except Exception as e:
             print(f"[stream] emit failed: {e}", file=sys.stderr, flush=True)
+            return False
 
     def random_sleep(self, min_sec: float, max_sec: float):
         delay = random.uniform(min_sec, max_sec)
@@ -469,6 +548,12 @@ class Porn91Spider:
             if self.target_new is not None and self.processed_videos >= self.target_new:
                 self.log(f"已累计 {self.processed_videos} 个新视频，达到目标 {self.target_new}，停止")
                 break
+            if self.stream_output and self.target_new is not None and self.emitted >= self.target_new:
+                self.log(f"已输出 {self.emitted} 个候选，达到 budget，停止")
+                break
+            if self._deadline_reached():
+                self.log("达到 job limits 截止条件，停止")
+                break
 
             base_url = f"{BASE_URL}?category={self.category}&viewtype=basic"
 
@@ -489,6 +574,7 @@ class Porn91Spider:
                 consecutive_empty += 1
                 page_num += 1
                 crawled_in_session += 1
+                self._maybe_progress(f"list page {page_num - 1} fetch failed")
                 continue
 
             page_videos = self.parse_list_page(page_html)
@@ -498,6 +584,7 @@ class Porn91Spider:
                 consecutive_empty += 1
                 page_num += 1
                 crawled_in_session += 1
+                self._maybe_progress(f"empty list page {page_num - 1}")
                 continue
 
             consecutive_empty = 0
@@ -513,6 +600,7 @@ class Porn91Spider:
             if new_videos:
                 self._process_video_list(new_videos, referer=page_url)
             self.pages_crawled += 1
+            self._maybe_progress(f"Scanning page {page_num}")
             page_num += 1
             crawled_in_session += 1
 
@@ -523,11 +611,18 @@ class Porn91Spider:
         for idx, video in enumerate(videos, 1):
             if self.target_new is not None and self.processed_videos >= self.target_new:
                 return
+            if self.stream_output and self.target_new is not None and self.emitted >= self.target_new:
+                return
+            if self._deadline_reached():
+                return
             if video['viewkey'] in self.skip_viewkeys:
                 self.log(f"  [SKIP] 已处理过: {video['viewkey']}")
                 self.skipped_videos += 1
+                self.checked += 1
+                self._maybe_progress()
                 continue
 
+            self.checked += 1
             self.log(f"  处理视频 {idx}/{len(videos)}: {video['title'][:40]}...")
 
             if idx > 1:
@@ -541,6 +636,7 @@ class Porn91Spider:
                 self.results.append(video)
                 self.skip_viewkeys.add(video['viewkey'])
                 self.failed_videos += 1
+                self._maybe_progress()
                 continue
 
             detail_info = self.parse_detail_page(detail_html)
@@ -558,6 +654,7 @@ class Porn91Spider:
                     )
                     self.failed_videos += 1
                     self.skip_viewkeys.add(video['viewkey'])
+                    self._maybe_progress()
                     continue
                 if not list_source_id and detail_source_id:
                     video["source_id"] = detail_source_id
@@ -569,6 +666,7 @@ class Porn91Spider:
                     if video["source_id"] in self.skip_viewkeys:
                         self.log(f"  [SKIP] 已处理过 source_id: {video['source_id']}")
                         self.skipped_videos += 1
+                        self._maybe_progress()
                         continue
                 self.results.append(video)
                 self.skip_viewkeys.add(video['viewkey'])
@@ -577,12 +675,14 @@ class Porn91Spider:
                 self.processed_videos += 1
                 self.log(f"  [OK] 成功提取视频直链")
                 self.emit_stream_video(video)
+                self._maybe_progress()
             else:
                 self.log(f"  [FAIL] 未找到视频直链: {video['viewkey']}")
                 video["video_url"] = ""
                 self.results.append(video)
                 self.skip_viewkeys.add(video['viewkey'])
                 self.failed_videos += 1
+                self._maybe_progress()
 
     def _save_results(self):
         output_data = {
@@ -662,18 +762,32 @@ def print_help():
 
 
 def run_job(job_path: str):
-    with open(job_path, "r", encoding="utf-8") as f:
-        job = json.load(f)
+    try:
+        with open(job_path, "r", encoding="utf-8") as f:
+            job = json.load(f)
+    except Exception as e:
+        print(f"错误: 无法读取 job 文件: {e}", file=sys.stderr, flush=True)
+        sys.exit(1)
 
     if job.get("protocol") != CRAWLER_PROTOCOL:
-        raise ValueError(f"unsupported crawler protocol: {job.get('protocol')!r}")
+        print(
+            f"错误: 不支持的协议: {job.get('protocol')!r}, 需要 {CRAWLER_PROTOCOL!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(1)
     if job.get("mode") not in ("", None, "crawl"):
-        raise ValueError(f"unsupported crawler mode: {job.get('mode')!r}")
+        print(
+            f"错误: 不支持的 mode: {job.get('mode')!r}",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(1)
 
     candidate_budget = positive_int(
         job.get("candidate_budget"),
         job.get("target_new"),
-        default=15,
+        default=10,
     )
     unique_target = positive_int(job.get("unique_target"), default=0)
     print(
@@ -688,6 +802,7 @@ def run_job(job_path: str):
     run_id = job.get("run_id") or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
     os.makedirs(output_dir, exist_ok=True)
     output_file = os.path.join(output_dir, f"spider91-{run_id}.json")
+    limits = job.get("limits") if isinstance(job.get("limits"), dict) else {}
 
     network = job.get("network") if isinstance(job.get("network"), dict) else {}
     proxy_url = str(network.get("proxy_url") or "").strip()
@@ -722,24 +837,27 @@ def run_job(job_path: str):
         target_new=candidate_budget,
         seen_viewkeys=seen_viewkeys,
         stream_output=True,
-        stream_protocol="crawler.v1",
+        stream_protocol="crawler.v2",
         category=category,
     )
+    spider.limits = limits
     try:
         spider.crawl()
         done = {
             "type": "done",
             "stats": {
-                "emitted": spider.processed_videos,
-                "failed": spider.failed_videos,
-                "skipped": spider.skipped_videos,
+                "checked": spider.checked,
+                "emitted": spider.emitted,
             },
         }
         write_jsonl(done)
-    except KeyboardInterrupt:
-        spider.log("\n用户中断，正在保存已爬取的数据...")
-        spider._save_results()
-        raise
+    except (KeyboardInterrupt, BrokenPipeError):
+        sys.exit(0)
+    except Exception as e:
+        print(f"错误: 爬虫执行失败: {e}", file=sys.stderr, flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stderr)
+        sys.exit(1)
 
 
 def main():
@@ -770,7 +888,7 @@ def main():
                         help="流式模式：每解析一条视频直链就立即把它作为一行 JSON 写到 stdout 并 flush；"
                              "日志改走 stderr。配合 backend 边读边下载使用。")
     parser.add_argument("--job", type=str, default=None,
-                        help="crawler.v1 job JSON 路径；作为通用脚本爬虫运行。")
+                        help="crawler.v2 job JSON 路径；作为通用脚本爬虫运行。")
     parser.add_argument("--category", type=str, default=DEFAULT_CATEGORY,
                         help="分类，默认 top；例如 --category top")
 
@@ -853,4 +971,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        sys.exit(0)

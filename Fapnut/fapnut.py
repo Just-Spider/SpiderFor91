@@ -21,10 +21,12 @@ import os
 import sys
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from urllib.parse import urljoin
 import threading
 
 CRAWLER_NAME = "fapnut"
+CRAWLER_PROTOCOL = "crawler.v2"
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
@@ -54,7 +56,48 @@ def log(msg):
 
 def emit(obj):
     """Write a JSON Lines object to stdout and flush."""
-    print(json.dumps(obj, ensure_ascii=False), flush=True)
+    try:
+        print(json.dumps(obj, ensure_ascii=False), flush=True)
+    except BrokenPipeError:
+        sys.exit(0)
+
+
+def positive_int(value, default=10):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def deadline_reached(limits, start_mono, last_item_mono, emitted):
+    limits = limits or {}
+    max_runtime = limits.get("max_runtime_seconds")
+    if max_runtime:
+        try:
+            if time.monotonic() - start_mono >= float(max_runtime):
+                return True
+        except (TypeError, ValueError):
+            pass
+    deadline_at = limits.get("deadline_at")
+    if deadline_at:
+        try:
+            text = str(deadline_at).replace("Z", "+00:00")
+            deadline = datetime.fromisoformat(text)
+            if deadline.tzinfo is None:
+                return datetime.utcnow() >= deadline
+            return datetime.now(timezone.utc) >= deadline.astimezone(timezone.utc)
+        except Exception:
+            pass
+    idle = limits.get("candidate_idle_timeout_seconds")
+    if idle:
+        try:
+            anchor = last_item_mono if emitted > 0 else start_mono
+            if time.monotonic() - anchor >= float(idle):
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
 
 
 # ── HTTP helper ────────────────────────────────────────────────────────────
@@ -275,6 +318,13 @@ def scrape_detail_page(session, page_url):
 
 # ── Item builder ───────────────────────────────────────────────────────────
 
+def sanitize_source_id(raw):
+    sanitized = re.sub(r"[^a-zA-Z0-9_.-]", "", str(raw or ""))
+    if not re.search(r"[A-Za-z0-9]", sanitized):
+        return ""
+    return sanitized[:160]
+
+
 def build_item(video):
     """
     Build a crawler item from video data.
@@ -283,17 +333,24 @@ def build_item(video):
         video: dict with keys from listing + detail scraping
 
     Returns:
-        dict suitable for stdout JSON Lines output
+        dict suitable for stdout JSON Lines output, or None if invalid
     """
+    source_id = sanitize_source_id(video.get("post_id"))
+    title = (video.get("title") or "").strip()
+    media_url = (video.get("video_url") or "").strip()
+    if not source_id or not title or not media_url:
+        return None
+
     item = {
         "type": "item",
-        "source_id": video["post_id"],
-        "title": video["title"],
-        "media_url": video["video_url"],
+        "source_id": source_id,
+        "title": title,
+        "media_url": media_url,
         "thumbnail_url": video["cover_image"] or video["cover_640x360"],
         "detail_url": video["page_url"],
         "headers": {
             "Referer": "https://fapnut.net/",
+            "User-Agent": HEADERS["User-Agent"],
         },
     }
 
@@ -303,14 +360,9 @@ def build_item(video):
 
     if video.get("categories"):
         item["tags"] = video["categories"]
-        # Use first category as primary
-        if video["categories"]:
-            item["category"] = video["categories"][0]
 
     if video.get("duration_seconds"):
         item["duration_seconds"] = video["duration_seconds"]
-    elif video.get("duration_str"):
-        item["duration"] = video["duration_str"]
 
     if video.get("upload_date"):
         item["published_at"] = video["upload_date"]
@@ -360,30 +412,37 @@ def run_job(job_path):
         log(f"ERROR: job file not found: {job_path}")
         sys.exit(1)
 
-    with open(job_path, "r", encoding="utf-8") as f:
-        job = json.load(f)
-
-    # candidate_budget - maximum number of candidates to output
-    candidate_budget = job.get("candidate_budget") or job.get("target_new") or 10
     try:
-        candidate_budget = int(candidate_budget)
-        if candidate_budget <= 0:
-            candidate_budget = 10
-    except (ValueError, TypeError):
-        candidate_budget = 10
+        with open(job_path, "r", encoding="utf-8") as f:
+            job = json.load(f)
+    except Exception as e:
+        log(f"ERROR: failed to read job file: {e}")
+        sys.exit(1)
 
-    # seen file
+    if job.get("protocol") != CRAWLER_PROTOCOL:
+        log(f"ERROR: unsupported protocol: {job.get('protocol')!r} "
+            f"(need {CRAWLER_PROTOCOL!r})")
+        sys.exit(1)
+    if job.get("mode") not in ("", None, "crawl"):
+        log(f"ERROR: unsupported mode: {job.get('mode')!r}")
+        sys.exit(1)
+
+    candidate_budget = positive_int(
+        job.get("candidate_budget") or job.get("target_new"),
+        default=10,
+    )
+
     seen_file = job.get("seen_source_ids_file", "")
-
-    # proxy
-    proxy_url = job.get("network", {}).get("proxy_url", "")
+    proxy_url = (job.get("network") or {}).get("proxy_url", "")
     proxies = None
     if proxy_url:
         proxies = {"http": proxy_url, "https": proxy_url}
         log(f"Using proxy: {proxy_url}")
 
-    # output_dir (for reference, not used for normal operation)
-    output_dir = job.get("output_dir", "")
+    limits = job.get("limits") if isinstance(job.get("limits"), dict) else {}
+    progress_interval = positive_int(
+        limits.get("progress_interval_seconds"), default=60
+    )
 
     log(f"Job started: candidate_budget={candidate_budget}, "
         f"seen_file={seen_file}, proxy={'yes' if proxy_url else 'no'}")
@@ -408,13 +467,31 @@ def run_job(job_path):
     checked = 0
     page_num = 1
     stopped_early = False
+    start_mono = time.monotonic()
+    last_item_mono = start_mono
+    last_progress_mono = start_mono
 
-    # When fetching detail pages: limit parallelism
     detail_lock = threading.Lock()
+
+    def maybe_progress(message=""):
+        nonlocal last_progress_mono
+        now = time.monotonic()
+        if not message and now - last_progress_mono < progress_interval:
+            return
+        emit({
+            "type": "progress",
+            "checked": checked,
+            "emitted": emitted,
+            "message": message or f"checked={checked} emitted={emitted}",
+        })
+        last_progress_mono = now
 
     for page_num in range(1, max_pages + 1):
         if emitted >= candidate_budget:
             stopped_early = True
+            break
+        if deadline_reached(limits, start_mono, last_item_mono, emitted):
+            log("Reached job deadline/limits, stopping")
             break
 
         # ── Fetch listing page ─────────────────────────────────────────
@@ -422,7 +499,7 @@ def run_job(job_path):
             page_videos = scrape_listing_page(session, page_num)
         except Exception as e:
             log(f"ERROR: Failed to scrape listing page {page_num}: {e}")
-            # Skip this page and continue
+            maybe_progress(f"Failed listing page {page_num}")
             if page_num < max_pages:
                 time.sleep(DELAY_BETWEEN_PAGES)
             continue
@@ -430,18 +507,21 @@ def run_job(job_path):
         checked += len(page_videos)
 
         # ── Filter already-seen videos ──────────────────────────────────
-        unseen = [
-            v for v in page_videos if v["post_id"] not in seen
-        ]
+        unseen = []
+        for v in page_videos:
+            sid = sanitize_source_id(v.get("post_id"))
+            if sid and sid not in seen:
+                v["post_id"] = sid
+                unseen.append(v)
 
         if not unseen:
             log(f"Page {page_num}/{max_pages}: {len(page_videos)} videos, "
                 f"0 new (all already seen)")
+            maybe_progress(f"Scanned page {page_num}/{max_pages}")
             if page_num < max_pages:
                 time.sleep(DELAY_BETWEEN_PAGES)
             continue
 
-        # Only fetch detail pages for videos we can still emit
         remaining = candidate_budget - emitted
         if len(unseen) > remaining:
             unseen = unseen[:remaining]
@@ -449,9 +529,7 @@ def run_job(job_path):
         log(f"Page {page_num}/{max_pages}: {len(page_videos)} videos, "
             f"{len(unseen)} new → need detail pages")
 
-        # ── Fetch detail pages (with thread pool) ───────────────────────
         def fetch_and_build(video):
-            """Fetch detail page and build an item."""
             detail = scrape_detail_page(session, video["page_url"])
             video["video_url"] = detail["video_url"]
             video["cover_640x360"] = detail["cover_640x360"]
@@ -460,17 +538,18 @@ def run_job(job_path):
             return build_item(video)
 
         with ThreadPoolExecutor(max_workers=DEFAULT_WORKERS) as executor:
-            # Submit all tasks
             future_to_video = {
                 executor.submit(fetch_and_build, v): v
                 for v in unseen
             }
 
-            # Collect results as they complete
             for future in as_completed(future_to_video):
                 if emitted >= candidate_budget:
                     stopped_early = True
-                    # Cancel remaining futures
+                    for f in future_to_video:
+                        f.cancel()
+                    break
+                if deadline_reached(limits, start_mono, last_item_mono, emitted):
                     for f in future_to_video:
                         f.cancel()
                     break
@@ -483,47 +562,38 @@ def run_job(job_path):
                         f"post {v['post_id']}: {e}")
                     continue
 
-                # Mark as seen (in-memory) and output
+                if not item:
+                    log(f"WARN: Invalid item for post {v['post_id']}, skip")
+                    continue
+
                 with detail_lock:
-                    if v["post_id"] in seen:
-                        continue  # Race condition guard
-                    seen.add(v["post_id"])
+                    if item["source_id"] in seen:
+                        continue
+                    seen.add(item["source_id"])
                     emit(item)
                     emitted += 1
+                    last_item_mono = time.monotonic()
+                    last_progress_mono = last_item_mono
 
-        # ── Progress event ──────────────────────────────────────────────
-        emit(
-            {
-                "type": "progress",
-                "checked": checked,
-                "emitted": emitted,
-                "message": f"Scanned page {page_num}/{max_pages}",
-            }
-        )
+        maybe_progress(f"Scanned page {page_num}/{max_pages}")
 
         if emitted >= candidate_budget:
             stopped_early = True
             break
 
-        # Brief pause between pages (be respectful)
         if page_num < max_pages:
             time.sleep(DELAY_BETWEEN_PAGES)
 
-    # If not stopped early and there are more pages, note we exhausted them
     if not stopped_early:
         page_num = min(page_num, max_pages)
 
-    # ── Done event ───────────────────────────────────────────────────────
-    emit(
-        {
-            "type": "done",
-            "stats": {
-                "checked": checked,
-                "emitted": emitted,
-                "pages_scanned": page_num,
-            },
-        }
-    )
+    emit({
+        "type": "done",
+        "stats": {
+            "checked": checked,
+            "emitted": emitted,
+        },
+    })
 
     log(f"Job complete: checked={checked}, emitted={emitted}, "
         f"pages={page_num}/{max_pages}")
@@ -630,6 +700,9 @@ def scrape_single_video(url):
     }
 
     item = build_item(video)
+    if not item:
+        log("ERROR: could not build valid item from page")
+        sys.exit(1)
     emit(item)
     return item
 

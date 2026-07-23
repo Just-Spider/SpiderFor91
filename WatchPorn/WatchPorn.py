@@ -6,11 +6,14 @@ import json
 import os
 import re
 import sys
+import time
+from datetime import datetime, timezone
 
 import requests
 from bs4 import BeautifulSoup
 
 CRAWLER_NAME = "WatchPorn"
+CRAWLER_PROTOCOL = "crawler.v2"
 
 HOST = "https://watchporn.to"
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
@@ -207,8 +210,11 @@ def parse_iso_duration(iso):
 
 
 def emit(event):
-    sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    try:
+        sys.stdout.write(json.dumps(event, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        sys.exit(0)
 
 
 def log(msg, *args):
@@ -216,41 +222,77 @@ def log(msg, *args):
     print(line, file=sys.stderr, flush=True)
 
 
+def positive_int(value, default=10):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def deadline_reached(limits, start_mono, last_item_mono, emitted):
+    limits = limits or {}
+    max_runtime = limits.get("max_runtime_seconds")
+    if max_runtime:
+        try:
+            if time.monotonic() - start_mono >= float(max_runtime):
+                return True
+        except (TypeError, ValueError):
+            pass
+    deadline_at = limits.get("deadline_at")
+    if deadline_at:
+        try:
+            text = str(deadline_at).replace("Z", "+00:00")
+            deadline = datetime.fromisoformat(text)
+            if deadline.tzinfo is None:
+                return datetime.utcnow() >= deadline
+            return datetime.now(timezone.utc) >= deadline.astimezone(timezone.utc)
+        except Exception:
+            pass
+    idle = limits.get("candidate_idle_timeout_seconds")
+    if idle:
+        try:
+            anchor = last_item_mono if emitted > 0 else start_mono
+            if time.monotonic() - anchor >= float(idle):
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
+
+
 def main():
     parser = argparse.ArgumentParser(description="WatchPorn.to crawler")
     parser.add_argument("--job", required=True, help="Path to job.json")
     args = parser.parse_args()
 
-    # Load job
     try:
-        with open(args.job, "r") as f:
+        with open(args.job, "r", encoding="utf-8") as f:
             job = json.load(f)
     except Exception as e:
         log("Failed to load job file: %s", e)
         sys.exit(1)
 
-    # Parse candidate_budget
-    candidate_budget = (
-        job.get("candidate_budget")
-        or job.get("target_new")
-        or 10
+    if job.get("protocol") != CRAWLER_PROTOCOL:
+        log("Unsupported protocol: %r (need %r)", job.get("protocol"), CRAWLER_PROTOCOL)
+        sys.exit(1)
+    if job.get("mode") not in ("", None, "crawl"):
+        log("Unsupported mode: %r", job.get("mode"))
+        sys.exit(1)
+
+    candidate_budget = positive_int(
+        job.get("candidate_budget") or job.get("target_new"),
+        default=10,
     )
-    try:
-        candidate_budget = int(candidate_budget)
-        if candidate_budget <= 0:
-            candidate_budget = 10
-    except (ValueError, TypeError):
-        candidate_budget = 10
 
     seen_file = job.get("seen_source_ids_file", "")
-    output_dir = job.get("output_dir", "/tmp")
-    proxy_url = job.get("network", {}).get("proxy_url", "")
+    proxy_url = (job.get("network") or {}).get("proxy_url", "")
+    limits = job.get("limits") if isinstance(job.get("limits"), dict) else {}
+    progress_interval = positive_int(limits.get("progress_interval_seconds"), default=60)
 
-    # Read seen IDs
     seen_ids = set()
     if seen_file and os.path.isfile(seen_file):
         try:
-            with open(seen_file, "r") as f:
+            with open(seen_file, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
                     if line:
@@ -259,7 +301,6 @@ def main():
         except Exception as e:
             log("Warning: failed to read seen file %s: %s", seen_file, e)
 
-    # Setup proxy
     proxies = None
     if proxy_url:
         proxies = {"http": proxy_url, "https": proxy_url}
@@ -268,15 +309,36 @@ def main():
     session = requests.Session()
     checked = 0
     emitted = 0
+    start_mono = time.monotonic()
+    last_item_mono = start_mono
+    last_progress_mono = start_mono
+
+    def maybe_progress(message=""):
+        nonlocal last_progress_mono
+        now = time.monotonic()
+        if not message and now - last_progress_mono < progress_interval:
+            return
+        emit({
+            "type": "progress",
+            "checked": checked,
+            "emitted": emitted,
+            "message": message or f"checked={checked} emitted={emitted}",
+        })
+        last_progress_mono = now
 
     try:
         for cat in CATEGORIES:
-            if emitted >= candidate_budget:
+            if emitted >= candidate_budget or deadline_reached(
+                limits, start_mono, last_item_mono, emitted
+            ):
                 break
 
             page = 1
             while emitted < candidate_budget:
-                # Fetch listing page
+                if deadline_reached(limits, start_mono, last_item_mono, emitted):
+                    log("Reached job deadline/limits, stopping")
+                    break
+
                 url = f"{HOST}/{cat}/"
                 if page > 1:
                     url += f"{page}/"
@@ -307,45 +369,55 @@ def main():
                 for item in items:
                     if emitted >= candidate_budget:
                         break
+                    if deadline_reached(limits, start_mono, last_item_mono, emitted):
+                        break
 
                     checked += 1
                     source_id = sanitize_source_id(item["id"])
-
-                    if source_id in seen_ids:
+                    if not source_id:
                         continue
 
-                    # Fetch embed page for video URL
-                    log("Fetching embed for vid=%s title=%s", source_id, item["title"][:50])
+                    if source_id in seen_ids:
+                        maybe_progress()
+                        continue
+
+                    title_preview = (item.get("title") or "")[:50]
+                    log("Fetching embed for vid=%s title=%s", source_id, title_preview)
                     try:
                         meta = fetch_embed_metadata(session, source_id, proxies)
                     except Exception as e:
                         log("Failed to fetch embed for %s: %s", source_id, e)
+                        maybe_progress()
                         continue
 
                     media_url = meta.get("media_url", "")
                     if not media_url:
                         log("No media_url found for vid=%s, skipping", source_id)
+                        maybe_progress()
                         continue
 
-                    # Build event
+                    title = (meta.get("title") or item.get("title") or "").strip() or "Video"
                     event = {
                         "type": "item",
                         "source_id": source_id,
-                        "title": meta.get("title") or item["title"],
+                        "title": title,
                         "media_url": media_url,
                         "thumbnail_url": meta.get("thumbnail_url") or item["pic"],
-                        "detail_url": f"{HOST}/video/{source_id}/{item['slug']}/" if item.get("slug") else f"{HOST}/video/{source_id}",
+                        "detail_url": (
+                            f"{HOST}/video/{source_id}/{item['slug']}/"
+                            if item.get("slug")
+                            else f"{HOST}/video/{source_id}"
+                        ),
                         "headers": {
                             "Referer": f"{HOST}/",
                             "User-Agent": UA,
                         },
                     }
 
-                    # Optional fields
-                    if meta.get("categories"):
-                        event["category"] = meta["categories"]
                     if meta.get("tags"):
-                        event["tags"] = [t.strip() for t in meta["tags"].split(",") if t.strip()]
+                        event["tags"] = [
+                            t.strip() for t in meta["tags"].split(",") if t.strip()
+                        ]
                     if meta.get("models"):
                         event["author"] = meta["models"]
                     if meta.get("duration_iso"):
@@ -355,20 +427,16 @@ def main():
 
                     emit(event)
                     emitted += 1
+                    seen_ids.add(source_id)
+                    last_item_mono = time.monotonic()
+                    last_progress_mono = last_item_mono
 
-                # Progress event
-                emit({
-                    "type": "progress",
-                    "checked": checked,
-                    "emitted": emitted,
-                    "message": f"Scanned {cat} page {page}",
-                })
+                maybe_progress(f"Scanned {cat} page {page}")
 
                 if page >= page_count:
                     break
                 page += 1
 
-        # Done
         emit({
             "type": "done",
             "stats": {
@@ -382,7 +450,6 @@ def main():
         log("Interrupted by user")
         sys.exit(0)
     except BrokenPipeError:
-        log("Broken pipe")
         sys.exit(0)
 
 

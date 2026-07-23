@@ -25,6 +25,7 @@ from bs4 import BeautifulSoup
 # 爬虫名称（必须声明）
 # ============================================================
 CRAWLER_NAME = "Truvaze"
+CRAWLER_PROTOCOL = "crawler.v2"
 
 # ============================================================
 # 常量
@@ -49,7 +50,10 @@ def log(msg: str) -> None:
 
 def emit(obj: dict) -> None:
     """输出一行 JSON 到 stdout。"""
-    print(json.dumps(obj, ensure_ascii=False), flush=True)
+    try:
+        print(json.dumps(obj, ensure_ascii=False), flush=True)
+    except BrokenPipeError:
+        sys.exit(0)
 
 
 def positive_int(*values, default: int) -> int:
@@ -74,10 +78,42 @@ def clean_source_id(raw: str) -> str:
     清洗 source_id：只保留字母、数字、下划线、中划线、点号。
     超过 160 字符则截断，和后端 source_id 规范保持一致。
     """
-    cleaned = re.sub(r"[^a-zA-Z0-9_\-.]", "", raw)
+    cleaned = re.sub(r"[^a-zA-Z0-9_\-.]", "", str(raw or ""))
+    if not re.search(r"[A-Za-z0-9]", cleaned):
+        return ""
     if len(cleaned) > 160:
         cleaned = cleaned[:160]
     return cleaned
+
+
+def deadline_reached(limits, start_mono, last_item_mono, emitted) -> bool:
+    limits = limits or {}
+    max_runtime = limits.get("max_runtime_seconds")
+    if max_runtime:
+        try:
+            if time.monotonic() - start_mono >= float(max_runtime):
+                return True
+        except (TypeError, ValueError):
+            pass
+    deadline_at = limits.get("deadline_at")
+    if deadline_at:
+        try:
+            text = str(deadline_at).replace("Z", "+00:00")
+            deadline = datetime.fromisoformat(text)
+            if deadline.tzinfo is None:
+                return datetime.utcnow() >= deadline
+            return datetime.now(timezone.utc) >= deadline.astimezone(timezone.utc)
+        except Exception:
+            pass
+    idle = limits.get("candidate_idle_timeout_seconds")
+    if idle:
+        try:
+            anchor = last_item_mono if emitted > 0 else start_mono
+            if time.monotonic() - anchor >= float(idle):
+                return True
+        except (TypeError, ValueError):
+            pass
+    return False
 
 
 def parse_duration(text: str) -> int | None:
@@ -352,29 +388,30 @@ def crawl(job: dict) -> None:
         default=10,
     )
     unique_target = positive_int(job.get("unique_target"), default=0)
-    output_dir = job.get("output_dir", ".")
     seen_file = job.get("seen_source_ids_file")
-    config = job.get("config", {})
+    config = job.get("config") if isinstance(job.get("config"), dict) else {}
+    limits = job.get("limits") if isinstance(job.get("limits"), dict) else {}
+    progress_interval = positive_int(
+        limits.get("progress_interval_seconds"), default=60
+    )
 
     # 可配置项
     sort_order = config.get("sort", "add")  # add=最新, favorite=点赞, view=观看数
     time_filter = config.get("time_filter", "")  # ''=日, weekly, monthly, all
-    max_pages = config.get("max_pages", 20)  # 最多翻页数
+    max_pages = positive_int(config.get("max_pages"), default=20)
 
     log(f"=== 开始爬取 Truvaze ===")
     log(
         f"run_id={run_id}, unique_target={unique_target or 'unknown'}, "
-        f"candidate_budget={candidate_budget}, sort={sort_order}, time_filter={time_filter or 'daily'}"
+        f"candidate_budget={candidate_budget}, sort={sort_order}, "
+        f"time_filter={time_filter or 'daily'}"
     )
 
-    # 加载已处理的 source_id
     seen = load_seen_ids(seen_file)
 
-    # 创建会话
-    proxy_url = job.get("network", {}).get("proxy_url")
+    proxy_url = (job.get("network") or {}).get("proxy_url")
     session = create_session(proxy_url)
 
-    # 构建列表页 URL
     if time_filter:
         list_path = f"/zh-CN/{time_filter}"
     else:
@@ -383,18 +420,32 @@ def crawl(job: dict) -> None:
     emitted = 0
     checked = 0
     page = 1
+    start_mono = time.monotonic()
+    last_item_mono = start_mono
+    last_progress_mono = start_mono
 
-    while emitted < candidate_budget and page <= max_pages:
-        # 构建带分页的 URL
-        list_url = urljoin(BASE_URL, f"{list_path}?sort={sort_order}&page={page}")
+    def maybe_progress(message: str = ""):
+        nonlocal last_progress_mono
+        now = time.monotonic()
+        if not message and now - last_progress_mono < progress_interval:
+            return
         emit(
             {
                 "type": "progress",
                 "checked": checked,
                 "emitted": emitted,
-                "message": f"正在扫描第 {page} 页 (sort={sort_order})",
+                "message": message or f"checked={checked} emitted={emitted}",
             }
         )
+        last_progress_mono = now
+
+    while emitted < candidate_budget and page <= max_pages:
+        if deadline_reached(limits, start_mono, last_item_mono, emitted):
+            log("达到 job limits 截止条件，停止")
+            break
+
+        list_url = urljoin(BASE_URL, f"{list_path}?sort={sort_order}&page={page}")
+        maybe_progress(f"正在扫描第 {page} 页 (sort={sort_order})")
 
         html = fetch(session, list_url)
         if not html:
@@ -413,38 +464,37 @@ def crawl(job: dict) -> None:
         for v in videos:
             if emitted >= candidate_budget:
                 break
+            if deadline_reached(limits, start_mono, last_item_mono, emitted):
+                break
 
             video_code = v["video_code"]
             source_id = clean_source_id(video_code)
 
             checked += 1
-
-            # 跳过已处理的
-            if source_id in seen:
-                log(f"跳过 seen: {source_id}")
+            if not source_id:
                 continue
 
-            # 获取详情页
-            time.sleep(MIN_DELAY + (emitted % 3) * 0.5)  # 渐进延时
+            if source_id in seen:
+                log(f"跳过 seen: {source_id}")
+                maybe_progress()
+                continue
+
+            time.sleep(MIN_DELAY + (emitted % 3) * 0.5)
             detail_html = fetch(session, v["detail_url"])
             if not detail_html:
-                log(f"详情页加载失败: {video_code}，仅输出列表页信息")
+                log(f"详情页加载失败: {video_code}")
                 detail = {}
             else:
-                detail = parse_detail_page(detail_html)
+                detail = parse_detail_page(detail_html) or {}
 
-            # 构建输出
             media_url = detail.get("media_url")
             if not media_url:
                 log(f"未找到直链: {video_code}，跳过")
-                # 标记为已见，不再重试
                 seen.add(source_id)
+                maybe_progress()
                 continue
 
             tags = detail.get("tags", [])
-            category = detail.get("category", "")
-
-            # title 使用 video_code（站点无独立标题）
             title = video_code
 
             item = {
@@ -453,7 +503,6 @@ def crawl(job: dict) -> None:
                 "title": title,
                 "media_url": media_url,
                 "detail_url": v["detail_url"],
-                "category": category,
                 "tags": tags,
                 "duration_seconds": v.get("duration_seconds"),
                 "description": detail.get("description", ""),
@@ -463,25 +512,19 @@ def crawl(job: dict) -> None:
                     "Origin": "https://x.com",
                     "Accept": "*/*",
                     "Accept-Language": "zh-CN,zh;q=0.9",
-                    "Sec-Fetch-Dest": "video",
-                    "Sec-Fetch-Mode": "cors",
-                    "Sec-Fetch-Site": "cross-site",
                 },
             }
 
-            # 缩略图
             if v.get("thumbnail_url"):
                 item["thumbnail_url"] = v["thumbnail_url"]
 
-            # 补充统计信息
             stats = {}
             if v.get("views"):
                 stats["views"] = v["views"]
             if v.get("likes"):
                 stats["likes"] = v["likes"]
             if stats:
-                # 用 description 附加统计信息
-                stats_str = " | ".join(f"{k}: {v}" for k, v in stats.items())
+                stats_str = " | ".join(f"{k}: {val}" for k, val in stats.items())
                 if item.get("description"):
                     item["description"] = f"{stats_str} | {item['description']}"
                 else:
@@ -490,11 +533,12 @@ def crawl(job: dict) -> None:
             emit(item)
             emitted += 1
             seen.add(source_id)
+            last_item_mono = time.monotonic()
+            last_progress_mono = last_item_mono
             log(f"[{emitted}/{candidate_budget}] 输出候选: {video_code}")
 
         page += 1
 
-    # 完成
     emit({"type": "done", "stats": {"emitted": emitted, "checked": checked}})
     log(f"=== 爬取完成: 检查 {checked} 个，输出 {emitted} 个 ===")
 
@@ -519,13 +563,18 @@ def main():
         log(f"无法读取 job.json: {e}")
         sys.exit(1)
 
-    # 验证基本字段
     protocol = job.get("protocol", "")
-    if protocol != "crawler.v1":
-        log(f"警告: protocol 不是 crawler.v1，而是 {protocol}，继续执行")
+    if protocol != CRAWLER_PROTOCOL:
+        log(f"错误: protocol 不是 {CRAWLER_PROTOCOL}，而是 {protocol}")
+        sys.exit(1)
+    if job.get("mode") not in ("", None, "crawl"):
+        log(f"错误: 不支持的 mode: {job.get('mode')!r}")
+        sys.exit(1)
 
     try:
         crawl(job)
+    except (KeyboardInterrupt, BrokenPipeError):
+        sys.exit(0)
     except Exception as e:
         log(f"爬取异常: {e}")
         import traceback
@@ -535,4 +584,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BrokenPipeError:
+        sys.exit(0)
