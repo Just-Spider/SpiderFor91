@@ -12,261 +12,280 @@ Ensure that the corresponding video and cover image can be downloaded directly v
 
 Second
 ````
-1. The script must be a single `.py` file.
+# Custom Python Crawler Protocol (`crawler.v2`)
+This document defines the `crawler.v2` interface between a custom Python crawler and the Go backend.
+If you want your script to run smoothly in the 91 project, then you also need to comply with crawler.v2.
 
-2. A static crawler name must be declared at the top of the file:
+## 1. Script file and metadata
 
-   ```python
-   CRAWLER_NAME = "your crawler name here"
-   ```
+The crawler must be a single `.py` file with these top-level constants:
 
-   Notes:
-   - Must be a string literal
-   - No dynamic concatenation
-   - The backend reads this value as the crawler name when importing the script
+```python
+CRAWLER_NAME = "Human-readable crawler name"
+CRAWLER_PROTOCOL = "crawler.v2"
+```
 
-3. The script must support the following command:
+- Both values must be plain string literals, not computed values or concatenations.
+- `CRAWLER_NAME` must be non-empty and at most 80 characters.
+- `CRAWLER_PROTOCOL` must be exactly `"crawler.v2"` for a new script.
+- The backend reads these constants statically when importing the file.
 
-   ```
-   python3 crawler_name.py --job /path/to/job.json
-   ```
+## 2. Entry point
 
-4. The `job.json` format is roughly as follows:
+The backend starts the script with:
 
-   ```json
-   {
-     "protocol": "crawler.v1",
-     "mode": "crawl",
-     "run_id": "20260609T120000Z",
-     "crawler_id": "example",
-     "target_new": 100,
-     "unique_target": 10,
-     "candidate_budget": 100,
-     "seen_source_ids_file": "/data/scriptcrawlers/example/.crawl/seen.txt",
-     "output_dir": "/data/scriptcrawlers/example/output",
-     "config": {},
-     "network": {
-       "proxy_url": "http://127.0.0.1:7890"
-     }
-   }
-   ```
+```bash
+python3 crawler_name.py --job /absolute/path/to/job.json
+```
 
-5. **Quantity semantics:**
+The script must:
 
-   - `unique_target`: the number of content-deduplicated new videos the user ultimately wants imported
-   - `candidate_budget`: the maximum number of candidate videos the script should output
-   - `target_new`: a legacy field; the current backend sets it equal to `candidate_budget`
+- Require the `--job` argument.
+- Read the job as UTF-8 JSON.
+- Verify that `job["protocol"] == CRAWLER_PROTOCOL`.
+- Run without interactive input.
+- Use paths from the job instead of assuming a fixed working directory.
 
-   The script must **not** perform its own deduplication. Content deduplication is handled by the Go backend. The script is only responsible for outputting at most `candidate_budget` candidate videos that are **not** in the seen list.
+## 3. Job format
 
-   Read the candidate count like this:
+```json
+{
+  "protocol": "crawler.v2",
+  "mode": "crawl",
+  "run_id": "20260723T120000Z",
+  "crawler_id": "example",
+  "target_new": 100,
+  "unique_target": 10,
+  "candidate_budget": 100,
+  "seen_source_ids_file": "/data/scriptcrawlers/example/.crawl/seen.txt",
+  "output_dir": "/data/scriptcrawlers/example/output",
+  "config": {},
+  "network": {
+    "proxy_url": "http://127.0.0.1:7890"
+  },
+  "limits": {
+    "max_runtime_seconds": 10800,
+    "deadline_at": "2026-07-23T15:00:00Z",
+    "progress_interval_seconds": 60,
+    "idle_timeout_seconds": 300,
+    "candidate_idle_timeout_seconds": 1800
+  }
+}
+```
 
-   ```python
-   candidate_budget = (
-       job.get("candidate_budget")
-       or job.get("target_new")
-       or 10
-   )
-   ```
+Fields:
 
-   Then cast to a positive integer. If parsing fails or the value is ≤ 0, default to `10`.
+- `unique_target`: Number of content-deduplicated new videos the user wants imported.
+- `candidate_budget`: Maximum number of `item` events the script may emit.
+- `target_new`: Alias of `candidate_budget` included by the backend. Prefer `candidate_budget` when reading the job.
+- `seen_source_ids_file`: Text file containing one previously processed `source_id` per line.
+- `output_dir`: The only directory where the script may create local media files.
+- `config`: Crawler-specific administrator configuration.
+- `network.proxy_url`: Optional administrator-configured proxy.
+- `limits`: Limits the script must honor; the backend also enforces them independently.
 
-6. **The script must read `seen_source_ids_file`.**
+Read the candidate budget defensively:
 
-   This file contains one `source_id` per line, representing video source IDs that the backend has already processed, deleted, or confirmed as duplicates.
+```python
+def positive_int(value, default=10):
+    try:
+        value = int(value)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
 
-   If a video's `source_id` is already in the seen file:
-   - It must be skipped
-   - Do not output that video
-   - Do not re-download or re-parse its detail page — unless parsing the detail page is the only way to obtain the `source_id`
 
-7. **`source_id` requirements:**
+candidate_budget = positive_int(
+    job.get("candidate_budget") or job.get("target_new")
+)
+```
 
-   - Must be stable
-   - Must uniquely identify this video on the site
-   - Do not use random numbers
-   - Do not use video direct links with expiring tokens
-   - Do not use URL parameters that change on every request
-   - Recommended: use the site's native ID, detail page slug, video ID, viewkey, etc.
+## 4. Candidate and seen-ID rules
 
-   If the raw ID contains special characters, sanitize it to include only:
-   - Letters
-   - Digits
-   - Underscores `_`
-   - Hyphens `-`
-   - Dots `.`
+The script produces candidates; the backend performs content deduplication.
 
-   Recommended maximum length: 160 characters.
+The script must:
 
-8. **`stdout` / `stderr` rules — critically important:**
+- Read `seen_source_ids_file` before crawling.
+- Skip a video whose `source_id` is already present.
+- Avoid emitting the same `source_id` twice in one run.
+- Emit no more than `candidate_budget` items.
+- Skip known IDs before opening detail pages or downloading data whenever the ID is available on the listing page.
 
-   - `stdout` must output **JSON Lines only**
-   - Every line on `stdout` must be a complete JSON object
-   - All regular logs, debug info, error messages, and tracebacks must go to `stderr`
-   - Do not write logs like `print("Requesting...")` to `stdout`
+The script must not perform content-fingerprint deduplication or try to predict which candidates the backend will deduplicate.
 
-9. As soon as each candidate video is found, immediately write one JSON line to `stdout` and flush:
+### `source_id`
 
-   ```python
-   print(json.dumps(event, ensure_ascii=False), flush=True)
-   ```
+Each item must have a stable source-site identifier, preferably the site's native video ID, view key, or permanent detail-page slug.
 
-10. **Recommended `item` output format:**
+Do not use random values, expiring media URLs, session-specific values, or request-specific query parameters.
 
-    ```json
-    {
-      "type": "item",
-      "source_id": "stable-video-id",
-      "title": "Video title",
-      "media_url": "https://example.com/video.mp4",
-      "thumbnail_url": "https://example.com/thumb.jpg",
-      "detail_url": "https://example.com/detail/xxx",
-      "headers": {
-        "Referer": "https://example.com/"
-      }
-    }
-    ```
+Normalize IDs to ASCII letters, digits, underscores, hyphens, and dots. The result must contain at least one ASCII letter or digit and should not exceed 160 characters. If hashing is necessary, hash a stable site-native value, never an expiring media URL.
 
-11. **Field requirements:**
+## 5. stdout and stderr
 
-    Required:
-    - `type`: `"item"`
-    - `source_id`
-    - `title`
-    - `media_url`
+`stdout` is a strict JSON Lines protocol channel:
 
-    Recommended:
-    - `thumbnail_url`
-    - `detail_url`
+- Every stdout line must be one complete JSON object.
+- Blank stdout lines are forbidden.
+- Only `item`, `progress`, and `done` event types are valid.
+- Event type values are case-sensitive.
+- Each event must be flushed immediately.
 
-    Optional:
-    - `author`
-    - `tags`
-    - `category`
-    - `duration_seconds`
-    - `description`
-    - `published_at`
-    - `quality`
+```python
+def emit(event):
+    print(json.dumps(event, ensure_ascii=False), flush=True)
+```
 
-12. **Header rules:**
+All logs, warnings, errors, debug output, and tracebacks must go to `stderr`.
 
-    If the video or thumbnail requires a hotlink referer, include `headers`:
+Do not emit `type=error`. On an unrecoverable error, write the error to `stderr` and exit with a non-zero status.
 
-    ```json
-    "headers": {
-      "Referer": "https://example.com/",
-      "User-Agent": "..."
-    }
-    ```
+## 6. `item` event
 
-    If the video and thumbnail require different headers, use:
+Emit each candidate as soon as it is ready:
 
-    ```json
-    "media_headers": {
-      "Referer": "..."
-    }
-    ```
+```json
+{
+  "type": "item",
+  "source_id": "stable-video-id",
+  "title": "Video title",
+  "media_url": "https://example.com/video.mp4",
+  "thumbnail_url": "https://example.com/thumb.jpg",
+  "detail_url": "https://example.com/detail/xxx",
+  "headers": {
+    "Referer": "https://example.com/",
+    "User-Agent": "Mozilla/5.0 ..."
+  }
+}
+```
 
-    ```json
-    "thumbnail_headers": {
-      "Referer": "..."
-    }
-    ```
+Required fields:
 
-13. **Proxy rules:**
+- `type`: Exactly `"item"`.
+- `source_id`: Stable identifier as defined above.
+- `title`: Non-empty title.
+- One of `media_url` or `media_local_file`.
 
-    Read the proxy from the job:
+Recommended fields:
 
-    ```python
-    proxy_url = job.get("network", {}).get("proxy_url")
-    ```
+- `thumbnail_url`
+- `detail_url`
 
-    If `proxy_url` is non-empty, pass it to `requests`:
+Optional fields:
 
-    ```python
-    proxies = {
-        "http": proxy_url,
-        "https": proxy_url,
-    }
-    ```
+- `author`
+- `tags`
+- `duration_seconds`
+- `description`
+- `published_at`
+- `quality`
 
-    Do not hardcode a proxy address in the script.
+### Request headers
 
-14. **Do not download videos yourself.**
+Use `headers` when media and thumbnail share the same request headers. When they differ, use `media_headers` and `thumbnail_headers` separately.
 
-    Under normal circumstances, the script only needs to output `media_url`. The backend handles:
-    - Downloading the video
-    - Downloading the thumbnail
-    - Content fingerprint deduplication
-    - Database ingestion
-    - Thumbnail generation
-    - Preview video generation
-    - Upload and migration
+Header names and values must be strings. Do not log credentials or sensitive headers.
 
-    Only if the video *must* be downloaded by the script to obtain it, download it into the `job["output_dir"]` directory and then output:
+## 7. Proxy and media handling
 
-    ```json
-    "media_local_file": "/path/inside/output_dir/video.mp4"
-    ```
+Read the proxy from the job and apply it to all relevant requests:
 
-    Notes:
-    - The local file must be inside `output_dir`
-    - Do not write to any other directory
+```python
+proxy_url = (job.get("network") or {}).get("proxy_url")
+proxies = None
+if proxy_url:
+    proxies = {"http": proxy_url, "https": proxy_url}
+```
 
-15. **Progress events are optional.**
+Do not hardcode or replace the administrator's proxy. Every network request must have a finite timeout; 30 seconds or less is recommended.
 
-    You may periodically output:
+Normally, the script should emit media and thumbnail URLs instead of downloading them. The backend handles downloading, fingerprints, deduplication, ingestion, thumbnails, previews, and upload.
 
-    ```json
-    {
-      "type": "progress",
-      "checked": 20,
-      "emitted": 3,
-      "message": "Scanning page 2"
-    }
-    ```
+If the script must materialize a video locally, the file must be complete, non-empty, and located inside `job["output_dir"]` before emitting:
 
-    At the end, you may output:
+```json
+{
+  "type": "item",
+  "source_id": "stable-id",
+  "title": "Video title",
+  "media_local_file": "/absolute/path/inside/output_dir/video.mp4"
+}
+```
 
-    ```json
-    {
-      "type": "done",
-      "stats": {
-        "checked": 50,
-        "emitted": 10
-      }
-    }
-    ```
+The script must not write crawler media outside `output_dir`.
 
-16. **Do not output `type=error` to `stdout`.**
+## 8. `progress` event
 
-    If an error occurs:
-    - Write to `stderr`
-    - Call `sys.exit(1)` if necessary
+While actively crawling, emit an `item` or `progress` event at least every `limits.progress_interval_seconds`, normally 60 seconds:
 
-    The current Go backend only cares about `item` / `progress` / `done`; error details belong on `stderr`.
+```json
+{
+  "type": "progress",
+  "checked": 20,
+  "emitted": 3,
+  "message": "Scanning page 2"
+}
+```
 
-17. **Script termination conditions:**
+- `checked` and `emitted` must be non-negative integers.
+- `emitted` should equal the number of item events emitted so far.
+- A progress event is a heartbeat but does not reset the no-candidate timer.
 
-    - Stop when `emitted >= candidate_budget`
-    - Stop when there are no more pages
-    - Exit quietly on `KeyboardInterrupt` or `BrokenPipeError`
+The backend stops a v2 script after `idle_timeout_seconds`, normally 300 seconds, without a valid `item`, `progress`, or `done` event.
 
-18. If the original script **saves a JSON file after crawling is complete**, rewrite it to **stream JSON Lines instead**:
+## 9. `done` event
 
-    - Emit each `item` as soon as it is found
-    - Do not wait until all crawling is done to output everything at once
+On normal completion, emit exactly one terminal `done` event:
 
-19. **Preserve the core crawling logic of the original script as much as possible.** Only change:
-    - The command-line entry point
-    - `job.json` reading
-    - Seen-file filtering
-    - `stdout` JSON Lines output
-    - `stderr` logging
-    - `candidate_budget` control
-    - `proxy_url` support
+```json
+{
+  "type": "done",
+  "stats": {
+    "checked": 50,
+    "emitted": 10
+  }
+}
+```
 
-20. Finalize the complete script without omitting any code, then **run a test** after writing it.
+- `stats.checked` and `stats.emitted` are required non-negative integers.
+- `checked` must not be less than `emitted`.
+- `emitted` must exactly match the number of item events emitted in this run.
+- Do not write anything to stdout after `done`.
+- Exit within 5 seconds after emitting `done`.
+
+Do not emit `done` after an unrecoverable error.
+
+The backend may intentionally stop the script after receiving enough candidates or the first dry-run item. If stdout closes early, handle `BrokenPipeError` quietly and exit; no `done` event is required for a backend-enforced early stop.
+
+## 10. Termination rules
+
+The script must stop normally when any of these conditions is met:
+
+- `emitted >= candidate_budget`.
+- The source has no more pages or candidates.
+- `limits.deadline_at` or `limits.max_runtime_seconds` is reached.
+- No item has been emitted for `limits.candidate_idle_timeout_seconds`.
+
+Pagination must also detect applicable end conditions such as an empty page, missing or repeated next cursor, repeated page signature, or repeated source-ID set. Do not use an unbounded pagination loop.
+
+Use monotonic time for elapsed durations. Exit quietly on `KeyboardInterrupt` and `BrokenPipeError`.
+
+## 11. Backend-enforced limits
+
+The backend enforces these safeguards for `crawler.v2`:
+
+- Maximum run time: 3 hours.
+- Maximum time without an item: 30 minutes.
+- Maximum item events: `candidate_budget`.
+- Maximum total stdout: 64 MiB.
+- Maximum stdout line: 1 MiB.
+- Maximum recorded stderr: 8 KiB per line and 1 MiB total.
+- The crawler process and its child process tree are terminated when the run stops.
+- Strict JSON Lines with valid event types and required fields.
+- Maximum time without a valid heartbeat event: 5 minutes.
+- A terminal `done` event on natural success.
+- Process exit within 5 seconds after `done`.
 ````
 
 ---
