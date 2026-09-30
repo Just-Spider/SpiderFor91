@@ -2,11 +2,15 @@
 """
 脚本名称: 91Porn
 用途: 爬取 91Porn 列表中的视频标题、视频下载直链、封面图直链和唯一标识，
-并按 crawler.v2 协议输出给 video-site-91 后端入库。
+并按 crawler.v3 协议响应项目的 discover、resolve 和 stop 命令。
 
-默认抓取热门分类(category=top)。
-CLI 参数 --category 可用于指定单个分类（例如 "top"、"new" 等）。
+默认抓取本月最热(category=top)。
+任务通过 feed_id 选择栏目；独立运行时仍可使用 --category。
 """
+
+CRAWLER_NAME = "91Porn"
+CRAWLER_PROTOCOL = "crawler.v3"
+CRAWLER_FEEDS = '[{"id":"top","label":"本月最热","default":true},{"id":"new","label":"最新"}]'
 
 import argparse
 import requests
@@ -18,8 +22,14 @@ import os
 import socket
 import sys
 import html
-from urllib.parse import urljoin, unquote, urlparse
-from datetime import datetime
+import traceback
+import unicodedata
+import queue
+import threading
+from email.utils import parsedate_to_datetime
+from urllib.parse import urljoin, urlparse, parse_qs, urlencode
+from datetime import datetime, timezone
+from urllib3.util import Timeout
 
 try:
     from bs4 import BeautifulSoup
@@ -55,6 +65,7 @@ LIST_PARAMS = {
     "viewtype": "basic"
 }
 DEFAULT_CATEGORY = "top"
+FEED_CATEGORIES = {"top": "top", "new": "mr"}
 
 HEADERS = {
     "User-Agent": (
@@ -88,16 +99,16 @@ OUTPUT_FILE = "91porn_videos.json"
 MAX_PAGES = None
 RESUME = True
 MAX_EMPTY_PAGES = 2
-CRAWLER_NAME = "91Porn"
-CRAWLER_PROTOCOL = "crawler.v2"
 
 
-def crawler_source_id(raw: str) -> str:
-    value = str(raw or "").strip()
-    if not value:
-        return ""
-    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._-")
-    return safe[:160]
+def decode_strencode2(value: str) -> str:
+    """源站 m2.js 使用 unescape，按 UTF-16 码元解码 %XX 和 %uXXXX。"""
+    decoded = re.sub(
+        r"%u([0-9A-Fa-f]{4})|%([0-9A-Fa-f]{2})",
+        lambda match: chr(int(match.group(1) or match.group(2), 16)),
+        value,
+    )
+    return decoded.encode("utf-16-le", errors="surrogatepass").decode("utf-16-le", errors="replace")
 
 
 def write_jsonl(event: dict):
@@ -105,17 +116,6 @@ def write_jsonl(event: dict):
         print(json.dumps(event, ensure_ascii=False), flush=True)
     except BrokenPipeError:
         sys.exit(0)
-
-
-def positive_int(*values, default: int) -> int:
-    for value in values:
-        try:
-            parsed = int(value)
-        except (TypeError, ValueError):
-            continue
-        if parsed > 0:
-            return parsed
-    return default
 
 
 class Porn91Spider:
@@ -130,8 +130,8 @@ class Porn91Spider:
         target_new: int = None,
         seen_viewkeys: list = None,
         stream_output: bool = False,
-        stream_protocol: str = "legacy",
         category: str = DEFAULT_CATEGORY,
+        automatic_retries: bool = True,
     ):
         self.session = requests.Session()
         self.session.headers.update(HEADERS)
@@ -147,7 +147,6 @@ class Porn91Spider:
         self.target_new = target_new if target_new and target_new > 0 else None
         self.quiet = bool(quiet)
         self.stream_output = bool(stream_output)
-        self.stream_protocol = stream_protocol or "legacy"
         self.category = (
             category.strip()
             if isinstance(category, str) and category.strip()
@@ -158,7 +157,7 @@ class Porn91Spider:
             from requests.adapters import HTTPAdapter
             from urllib3.util.retry import Retry
             retry_strategy = Retry(
-                total=MAX_RETRIES,
+                total=MAX_RETRIES if automatic_retries else 0,
                 backoff_factor=1,
                 status_forcelist=[429, 500, 502, 503, 504],
             )
@@ -275,36 +274,10 @@ class Porn91Spider:
         if not self.stream_output:
             return False
         try:
-            if self.stream_protocol == "crawler.v2":
-                source_id = crawler_source_id(video.get("source_id") or video.get("viewkey") or "")
-                media_url = video.get("video_url") or ""
-                title = (video.get("title") or "").strip()
-                if not source_id or not media_url or not title:
-                    self.log(
-                        f"[stream] skip invalid item: source_id={source_id!r} "
-                        f"media_url={bool(media_url)} title={bool(title)}"
-                    )
-                    return False
-                event = {
-                    "type": "item",
-                    "source_id": source_id,
-                    "title": title,
-                    "detail_url": video.get("detail_url") or "",
-                    "author": "91porn",
-                    "tags": ["91porn"],
-                    "media_url": media_url,
-                    "thumbnail_url": video.get("thumb_url") or "",
-                    "headers": {
-                        "Referer": video.get("detail_url") or BASE_URL,
-                        "User-Agent": HEADERS["User-Agent"],
-                    },
-                }
-                write_jsonl(event)
-                self.emitted += 1
-                self._last_item_at = time.monotonic()
-                self._last_progress_at = time.monotonic()
-                return True
             write_jsonl(video)
+            self.emitted += 1
+            self._last_item_at = time.monotonic()
+            self._last_progress_at = time.monotonic()
             return True
         except BrokenPipeError:
             sys.exit(0)
@@ -369,28 +342,30 @@ class Porn91Spider:
                     return ""
         return ""
 
-    def parse_list_page(self, html: str) -> list:
+    def parse_list_page(self, html: str, base_url: str = BASE_URL) -> list:
         videos = []
         soup = BeautifulSoup(html, 'lxml')
 
-        video_cards = soup.select('div.col-xs-12.col-sm-4.col-md-3.col-lg-3')
+        video_cards = (soup.select('div.col-xs-12.col-sm-4.col-md-3.col-lg-3')
+                       or soup.select('a[href*="view_video.php"]'))
 
         seen_cards = set()
 
         for card in video_cards:
-            link = card.find('a', href=re.compile(r'view_video\.php\?viewkey='))
+            link = card if card.name == 'a' else card.find(
+                'a', href=re.compile(r'view_video\.php\?'))
             if not link:
                 continue
             href = link.get('href', '')
             if not href:
                 continue
 
-            match = re.search(r'viewkey=([^&]+)', href)
-            if not match:
+            viewkeys = parse_qs(urlparse(href).query).get('viewkey', [])
+            if not viewkeys or not viewkeys[0]:
                 continue
-            viewkey = match.group(1)
+            viewkey = viewkeys[0]
 
-            detail_url = urljoin(BASE_URL, href)
+            detail_url = urljoin(base_url, href)
 
             title = self._extract_title(link)
 
@@ -403,11 +378,11 @@ class Porn91Spider:
             if img:
                 thumb_url = img.get('src', '') or img.get('data-original', '')
                 if thumb_url:
-                    thumb_url = urljoin(BASE_URL, thumb_url)
+                    thumb_url = urljoin(base_url, thumb_url)
             if not source_id and thumb_url:
                 source_id = self._extract_thumb_source_id(thumb_url)
 
-            card_key = source_id or detail_url
+            card_key = viewkey
             if card_key in seen_cards:
                 continue
             seen_cards.add(card_key)
@@ -438,25 +413,33 @@ class Porn91Spider:
         text = re.sub(r'\s+', ' ', text).strip()
         return html.unescape(text)[:120]
 
-    def parse_detail_page(self, html: str) -> dict:
+    def parse_detail_page(self, html_text: str, base_url: str = BASE_URL) -> dict:
         result = {}
 
-        if not html:
+        if not html_text:
             return result
 
-        title = self._extract_detail_title(html)
+        title = self._extract_detail_title(html_text)
         if title:
             result["title"] = title
 
-        strencode_match = re.search(r'strencode2\(["\']([^"\']+)["\']\)', html)
+        soup = BeautifulSoup(html_text, 'lxml')
+        video = soup.find('video')
+        image = soup.find('meta', property='og:image')
+        thumb_url = (video.get('poster', '') if video else '') or (
+            image.get('content', '') if image else '')
+        if thumb_url:
+            result["thumb_url"] = urljoin(base_url, html.unescape(thumb_url))
+
+        strencode_match = re.search(r'strencode2\s*\(\s*["\']([^"\']+)["\']\s*\)', html_text)
         if strencode_match:
             encoded = strencode_match.group(1)
             try:
-                decoded = unquote(encoded)
+                decoded = decode_strencode2(encoded)
 
                 src_match = re.search(r"src=['\"]([^'\"]+)['\"]", decoded)
                 if src_match:
-                    video_url = src_match.group(1)
+                    video_url = urljoin(base_url, html.unescape(src_match.group(1)))
                     video_url = re.sub(r'(https?://[^/]+)//+', r'\1/', video_url)
                     result["video_url"] = video_url
                     result["source_id"] = self._extract_source_id(video_url)
@@ -464,14 +447,22 @@ class Porn91Spider:
             except Exception as e:
                 self.log(f"  解码 strencode2 失败: {e}")
 
+        source = soup.select_one('video source[src], video[src], source[src]')
+        if source:
+            video_url = urljoin(base_url, html.unescape(source.get('src', '')))
+            if video_url:
+                result["video_url"] = video_url
+                result["source_id"] = self._extract_source_id(video_url)
+                return result
+
         mp4_match = re.search(
-            r'https?://[^\s"\'"<>]+\.mp4[^\s"\'"<>]*',
-            html
+            r'https?://[^\s"\'<>]+\.(?:mp4|m3u8)[^\s"\'<>]*',
+            html_text
         )
         if mp4_match:
             url = mp4_match.group(0)
             if 'kwai' not in url and 'ad-' not in url.lower():
-                result["video_url"] = url
+                result["video_url"] = html.unescape(url)
                 result["source_id"] = self._extract_source_id(url)
                 return result
 
@@ -726,10 +717,361 @@ class Porn91Spider:
         self.log("=" * 60)
 
 
+def utf8_prefix(value: str, max_bytes: int) -> str:
+    return value.encode("utf-8")[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def protocol_identifier(value, name: str) -> str:
+    if (not isinstance(value, str) or not value or value != value.strip()
+            or len(value.encode("utf-8")) > 512
+            or any(unicodedata.category(char) == "Cc" for char in value)):
+        raise ValueError(f"{name} 必须是 1–512 字节且不含控制字符或首尾空白的字符串")
+    return value
+
+
+def http_url(value) -> str:
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 8192:
+        raise ValueError("URL 必须是最多 8192 字节的 HTTP(S) 地址")
+    parsed = urlparse(value)
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or any(char.isspace() or unicodedata.category(char) == "Cc" for char in value)):
+        raise ValueError("URL 必须是无内嵌凭据的绝对 HTTP(S) 地址")
+    parsed.port  # 同时检查端口格式。
+    return value
+
+
+def protocol_headers(headers) -> dict:
+    if not isinstance(headers, dict) or len(headers) > 64:
+        raise ValueError("headers 必须是最多 64 项的对象")
+    for name, value in headers.items():
+        if (not isinstance(name, str) or len(name.encode("utf-8")) > 256
+                or not re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", name)
+                or not isinstance(value, str) or len(value.encode("utf-8")) > 8192
+                or any(char in value for char in "\r\n\0")):
+            raise ValueError("请求头名称或值不符合协议")
+    return headers
+
+
+class SourceError(Exception):
+    def __init__(self, scope, code, message, retryable=False, retry_after=None):
+        super().__init__(message)
+        self.fields = {
+            "scope": scope, "code": code,
+            "message": utf8_prefix(str(message), 8192) or "请求失败",
+            "retryable": bool(retryable),
+        }
+        if retry_after is not None:
+            self.fields["retry_after_seconds"] = max(0, min(86400, int(retry_after)))
+
+
+class CommandDeadline:
+    """用单调时钟跟踪命令预算，预留最终 JSON 响应的时间。"""
+    def __init__(self, deadline_at, scope):
+        deadline = datetime.fromisoformat(deadline_at.replace("Z", "+00:00"))
+        if deadline.tzinfo is None or deadline.utcoffset() is None:
+            raise ValueError("deadline_at 必须包含时区")
+        seconds = (deadline - datetime.now(timezone.utc)).total_seconds()
+        self.expires_at = time.monotonic() + seconds - 0.05
+        self.scope = scope
+        self.cancelled = threading.Event()
+
+    def remaining(self):
+        seconds = self.expires_at - time.monotonic()
+        if self.cancelled.is_set() or seconds <= 0:
+            raise SourceError(self.scope, "source_unavailable", "命令截止时间已到", True)
+        return seconds
+
+    def timeout(self):
+        return min(30.0, self.remaining())
+
+
+def run_before_deadline(operation, deadline, *args):
+    # requests 的读取超时不限制持续分块传输的总时长；主线程额外限制整个命令。
+    outcomes = queue.Queue(maxsize=1)
+
+    def execute():
+        try:
+            outcomes.put((operation(*args, deadline), None))
+        except Exception as error:
+            outcomes.put((None, error))
+
+    deadline.remaining()
+    worker = threading.Thread(target=execute, daemon=True)
+    worker.start()
+    try:
+        result, error = outcomes.get(timeout=deadline.remaining())
+    except queue.Empty:
+        deadline.cancelled.set()
+        raise SourceError(deadline.scope, "source_unavailable", "命令截止时间已到", True)
+    deadline.remaining()
+    if error is not None:
+        raise error
+    return result
+
+
+class Porn91ProtocolCrawler:
+    def __init__(self, job):
+        self.feed_id = job["feed_id"]
+        self.category = FEED_CATEGORIES[self.feed_id]
+        config = job.get("config", {})
+        self.base_url = http_url(config.get("base_url", "https://www.91porn.com")).rstrip("/") + "/"
+        self.list_url = urljoin(self.base_url, "v.php")
+        self.custom_headers = protocol_headers(config.get("headers", {}))
+        self.max_pages = config.get("max_pages")
+        if self.max_pages is not None and (type(self.max_pages) is not int or self.max_pages < 1):
+            raise ValueError("config.max_pages 必须是正整数")
+        self.spider = Porn91Spider(
+            resume=False, quiet=True, stream_output=True,
+            category=self.category, automatic_retries=False,
+        )
+        self.session = self.spider.session
+        self.session.headers.update(self.custom_headers)
+        self.session.cookies.clear()
+        self.session.cookies.set("mode", "d", domain=urlparse(self.base_url).hostname, path="/")
+        proxy_url = job.get("network", {}).get("proxy_url")
+        if proxy_url:
+            self.session.proxies.update({"http": proxy_url, "https": proxy_url})
+        self.pages = {}
+        self.metadata = {}
+
+    def page_url(self, page):
+        return self.list_url + "?" + urlencode({
+            "category": self.category, "viewtype": "basic", "page": page,
+        })
+
+    @staticmethod
+    def retry_after(value):
+        if not value:
+            return None
+        try:
+            return max(0, min(86400, int(value)))
+        except (TypeError, ValueError):
+            try:
+                date = parsedate_to_datetime(value)
+                return max(0, min(86400, int((date - datetime.now(timezone.utc)).total_seconds())))
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+    def fetch_page(self, url, deadline, scope, referer):
+        # 每次抓取使用独立 Session，过期命令不会把迟到的 Cookie 写入后续命令。
+        with requests.Session() as session:
+            session.headers.update(self.session.headers)
+            session.cookies.update(self.session.cookies)
+            session.proxies.update(self.session.proxies)
+            session.trust_env = self.session.trust_env
+            for _ in range(11):
+                deadline.remaining()
+                try:
+                    with session.get(
+                        http_url(url), headers={"Referer": referer},
+                        timeout=Timeout(total=deadline.timeout()),
+                        allow_redirects=False, stream=True,
+                    ) as response:
+                        deadline.remaining()
+                        status = response.status_code
+                        if status in {301, 302, 303, 307, 308}:
+                            location = response.headers.get("Location")
+                            if not location:
+                                raise SourceError(scope, "parse_failed", "重定向缺少 Location")
+                            url = http_url(urljoin(url, location))
+                            continue
+                        if status >= 400:
+                            code = {401: "auth_required", 403: "auth_required",
+                                    404: "not_found", 410: "not_found",
+                                    429: "rate_limited"}.get(status, "source_unavailable")
+                            error_scope = "source" if code in {
+                                "auth_required", "rate_limited", "source_unavailable",
+                            } else scope
+                            raise SourceError(
+                                error_scope, code, f"源站返回 HTTP {status}",
+                                code in {"rate_limited", "source_unavailable"},
+                                self.retry_after(response.headers.get("Retry-After"))
+                                if code in {"rate_limited", "source_unavailable"} else None,
+                            )
+                        chunks = []
+                        size = 0
+                        for chunk in response.iter_content(chunk_size=65536):
+                            deadline.remaining()
+                            size += len(chunk)
+                            if size > 8 * 1024 * 1024:
+                                raise SourceError(scope, "parse_failed", "源站 HTML 超过 8 MiB")
+                            chunks.append(chunk)
+                        text = b"".join(chunks).decode("utf-8", errors="replace")
+                        deadline.remaining()
+                        self.check_page(text)
+                        self.session.cookies.update(session.cookies)
+                        return text
+                except requests.exceptions.RequestException as error:
+                    raise SourceError("source", "source_unavailable", "源站网络请求失败", True) from error
+            raise SourceError("source", "source_unavailable", "源站重定向次数过多", True)
+
+    @staticmethod
+    def check_page(text):
+        if ("Just a moment" in text and len(text) < 8000) or (
+            "cf-chl-" in text and "/cdn-cgi/challenge-platform/" in text
+        ):
+            raise SourceError("source", "auth_required", "源站要求通过访问验证或提供有效 Cookie")
+        if (re.search(r"请先登录|請先登錄|需要登录|需要登入|please\s+log\s*in", text, re.IGNORECASE)
+                and not re.search(r"view_video\.php|<video\b|<source\b|strencode2\(", text)):
+            raise SourceError("source", "auth_required", "源站要求登录或登录已失效")
+
+    def next_page(self, text, page):
+        if self.max_pages is not None and page >= self.max_pages:
+            return None
+        soup = BeautifulSoup(text, "lxml")
+        later_pages = []
+        for link in soup.select("a[href]"):
+            if link.get("aria-disabled") == "true" or "disabled" in link.get("class", []):
+                continue
+            address = urlparse(urljoin(self.list_url, link["href"]))
+            if address.path != urlparse(self.list_url).path:
+                continue
+            query = parse_qs(address.query)
+            if query.get("category", [self.category])[0] != self.category:
+                continue
+            try:
+                number = int(query.get("page", ["1"])[0])
+            except ValueError:
+                continue
+            if number > page:
+                later_pages.append(number)
+        # 某些分页控件只显示“末页”；仍逐页推进，避免跳过中间候选。
+        return page + 1 if later_pages else None
+
+    def discover(self, cursor, limit, deadline):
+        deadline.remaining()
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit 必须是 1–100 的整数")
+        if cursor is None:
+            page, offset = 1, 0
+        else:
+            protocol_identifier(cursor, "cursor")
+            match = re.fullmatch(r"page:([1-9][0-9]*):(0|[1-9][0-9]*)", cursor)
+            if not match:
+                raise ValueError("无效的分页游标")
+            page, offset = map(int, match.groups())
+        if page not in self.pages:
+            text = self.fetch_page(self.page_url(page), deadline, "source", self.list_url)
+            rows = self.spider.parse_list_page(text, self.list_url)
+            soup = BeautifulSoup(text, "lxml")
+            if not rows and not (
+                soup.select_one(".row, .pagination, #videobox")
+                or re.search(r"暂无视频|暫無影片|没有视频|no\s+videos", soup.get_text(), re.IGNORECASE)
+            ):
+                raise SourceError("source", "parse_failed", "未识别到视频列表结构")
+            previous_keys = {
+                key for number, cached in self.pages.items() if number < page
+                for key in cached["keys"]
+            }
+            items = []
+            keys = set()
+            for row in rows:
+                viewkey = protocol_identifier(row["viewkey"], "viewkey")
+                key = protocol_identifier("viewkey:" + viewkey, "discovery_key")
+                keys.add(key)
+                if key in previous_keys:
+                    continue
+                items.append({
+                    "discovery_key": key, "source_id": viewkey,
+                    "locator": {"viewkey": viewkey},
+                })
+            following = self.next_page(text, page) if items else None
+            deadline.remaining()
+            self.pages[page] = {"items": items, "keys": keys, "next_page": following}
+            for row in rows:
+                self.metadata.setdefault(row["viewkey"], row)
+        cached = self.pages[page]
+        if offset > len(cached["items"]):
+            raise ValueError("分页游标偏移超出范围")
+        selected = cached["items"][offset:offset + limit]
+        end = offset + len(selected)
+        next_cursor = (
+            f"page:{page}:{end}" if end < len(cached["items"])
+            else f"page:{cached['next_page']}:0" if cached["next_page"] is not None else None
+        )
+        deadline.remaining()
+        return {"items": selected, "next_cursor": next_cursor}
+
+    def media_object(self, url, referer):
+        url = http_url(url)
+        headers = {"User-Agent": self.session.headers["User-Agent"], "Referer": referer}
+        headers.update(self.custom_headers)
+        prepared = self.session.prepare_request(requests.Request("GET", url, headers=headers))
+        if prepared.headers.get("Cookie"):
+            headers["Cookie"] = prepared.headers["Cookie"]
+        return {"type": "url", "url": url, "headers": protocol_headers(headers)}
+
+    def resolve(self, candidate, deadline):
+        deadline.remaining()
+        key = protocol_identifier(candidate["discovery_key"], "discovery_key")
+        viewkey = protocol_identifier(candidate["locator"]["viewkey"], "locator.viewkey")
+        source_id = protocol_identifier(candidate.get("source_id", viewkey), "source_id")
+        detail_url = urljoin(self.base_url, "view_video.php") + "?" + urlencode({"viewkey": viewkey})
+        text = self.fetch_page(detail_url, deadline, "item", self.list_url)
+        detail = self.spider.parse_detail_page(text, detail_url)
+        if not detail.get("video_url"):
+            visible_text = BeautifulSoup(text, "lxml").get_text(" ", strip=True)
+            if re.search(r"视频不存在|影片不存在|视频已删除|video\s+(?:not\s+found|does\s+not\s+exist)",
+                         visible_text, re.IGNORECASE):
+                raise SourceError("item", "not_found", "该视频不存在或已被删除")
+            raise SourceError("item", "parse_failed", "未能从详情页解析视频地址")
+        row = self.metadata.get(viewkey, {})
+        list_id, media_id = row.get("source_id"), detail.get("source_id")
+        if list_id and media_id and list_id != media_id:
+            raise SourceError("item", "parse_failed", "详情页媒体与列表视频不匹配")
+        title = utf8_prefix(str(detail.get("title") or row.get("title") or "").strip(), 4096)
+        if not title:
+            raise SourceError("item", "parse_failed", "未能解析非空视频标题")
+        result = {
+            "discovery_key": key, "source_id": source_id, "title": title,
+            "detail_url": detail_url,
+            "media": self.media_object(detail["video_url"], detail_url),
+        }
+        thumbnail = detail.get("thumb_url") or row.get("thumb_url")
+        if thumbnail:
+            result["thumbnail"] = self.media_object(thumbnail, detail_url)
+        deadline.remaining()
+        return result
+
+
+class ProtocolWriter:
+    def __init__(self):
+        self.total_bytes = 0
+
+    def write(self, response):
+        line = json.dumps(response, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+        size = len(line.encode("utf-8"))
+        if size > 1024 * 1024 or self.total_bytes + size > 64 * 1024 * 1024:
+            raise ValueError("协议输出超过大小限制")
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        self.total_bytes += size
+
+
+def unique_json_keys(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"JSON 包含重复字段: {key}")
+        result[key] = value
+    return result
+
+
+def load_protocol_json(text):
+    def reject_constant(value):
+        raise ValueError(f"JSON 包含非法常量: {value}")
+
+    value = json.loads(text, object_pairs_hook=unique_json_keys, parse_constant=reject_constant)
+    if not isinstance(value, dict):
+        raise ValueError("协议 JSON 必须是对象")
+    return value
+
+
 def print_help():
     print("""
 ================================================
-    91porn 视频爬虫 v1.0
+    91porn 视频爬虫 (crawler.v3)
 ================================================
 
 本脚本将爬取 91porn 列表下的所有视频信息：
@@ -741,8 +1083,9 @@ def print_help():
     pip install requests beautifulsoup4 lxml PySocks
 
 使用方法:
-    python spider_91porn.py
-    python spider_91porn.py --category top
+    python 91Porn.py --job /absolute/path/to/job.json
+    python 91Porn.py
+    python 91Porn.py --category top
 
 配置说明 (编辑脚本内 "配置区域"):
     MIN_PAGE_DELAY / MAX_PAGE_DELAY : 列表页请求间隔 (默认 3-6 秒)
@@ -762,102 +1105,78 @@ def print_help():
 
 
 def run_job(job_path: str):
-    try:
-        with open(job_path, "r", encoding="utf-8") as f:
-            job = json.load(f)
-    except Exception as e:
-        print(f"错误: 无法读取 job 文件: {e}", file=sys.stderr, flush=True)
-        sys.exit(1)
-
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+    with open(job_path, "r", encoding="utf-8") as file:
+        job = load_protocol_json(file.read())
     if job.get("protocol") != CRAWLER_PROTOCOL:
-        print(
-            f"错误: 不支持的协议: {job.get('protocol')!r}, 需要 {CRAWLER_PROTOCOL!r}",
-            file=sys.stderr,
-            flush=True,
-        )
-        sys.exit(1)
-    if job.get("mode") not in ("", None, "crawl"):
-        print(
-            f"错误: 不支持的 mode: {job.get('mode')!r}",
-            file=sys.stderr,
-            flush=True,
-        )
-        sys.exit(1)
-
-    candidate_budget = positive_int(
-        job.get("candidate_budget"),
-        job.get("target_new"),
-        default=10,
-    )
-    unique_target = positive_int(job.get("unique_target"), default=0)
-    print(
-        f"[job] unique_target={unique_target or 'unknown'} candidate_budget={candidate_budget}",
-        file=sys.stderr,
-        flush=True,
-    )
-    seen_file = job.get("seen_source_ids_file") or ""
-    config = job.get("config") if isinstance(job.get("config"), dict) else {}
-    category = str(config.get("category") or DEFAULT_CATEGORY).strip() or DEFAULT_CATEGORY
-    output_dir = job.get("output_dir") or os.getcwd()
-    run_id = job.get("run_id") or datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
-    os.makedirs(output_dir, exist_ok=True)
-    output_file = os.path.join(output_dir, f"spider91-{run_id}.json")
-    limits = job.get("limits") if isinstance(job.get("limits"), dict) else {}
-
-    network = job.get("network") if isinstance(job.get("network"), dict) else {}
-    proxy_url = str(network.get("proxy_url") or "").strip()
+        raise ValueError(f"不支持的协议，需要 {CRAWLER_PROTOCOL}")
+    if job.get("feed_id") not in {feed["id"] for feed in json.loads(CRAWLER_FEEDS)}:
+        raise ValueError("不支持的 feed_id")
+    for field in ("task_id", "crawler_id"):
+        if not isinstance(job.get(field), str) or not job[field].strip():
+            raise ValueError(f"{field} 必须是非空字符串")
+    if not isinstance(job.get("work_dir"), str) or not os.path.isabs(job["work_dir"]):
+        raise ValueError("work_dir 必须是绝对路径")
+    for field in ("config", "network"):
+        if field not in job:
+            job[field] = {}
+        if not isinstance(job[field], dict):
+            raise ValueError(f"{field} 必须是对象")
+    proxy_url = job["network"].get("proxy_url")
+    if proxy_url is not None and (not isinstance(proxy_url, str) or not proxy_url.strip()):
+        raise ValueError("network.proxy_url 必须是非空字符串")
     if proxy_url:
-        os.environ["HTTP_PROXY"] = proxy_url
-        os.environ["HTTPS_PROXY"] = proxy_url
-        os.environ["http_proxy"] = proxy_url
-        os.environ["https_proxy"] = proxy_url
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ[name] = proxy_url
         os.environ["NO_PROXY"] = ""
         os.environ["no_proxy"] = ""
-
-    seen_viewkeys = []
-    if seen_file:
-        try:
-            with open(seen_file, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        seen_viewkeys.append(line)
-        except FileNotFoundError:
-            print(f"警告: seen_source_ids_file 不存在: {seen_file}", file=sys.stderr, flush=True)
-        except Exception as e:
-            print(f"警告: 读取 seen_source_ids_file 失败: {e}", file=sys.stderr, flush=True)
-
     prefer_ipv4_for_plain_socks5_proxy()
-    spider = Porn91Spider(
-        output_file=output_file,
-        start_page=1,
-        max_pages=None,
-        resume=False,
-        quiet=True,
-        target_new=candidate_budget,
-        seen_viewkeys=seen_viewkeys,
-        stream_output=True,
-        stream_protocol="crawler.v2",
-        category=category,
-    )
-    spider.limits = limits
+    crawler = Porn91ProtocolCrawler(job)
+    writer = ProtocolWriter()
     try:
-        spider.crawl()
-        done = {
-            "type": "done",
-            "stats": {
-                "checked": spider.checked,
-                "emitted": spider.emitted,
-            },
-        }
-        write_jsonl(done)
-    except (KeyboardInterrupt, BrokenPipeError):
-        sys.exit(0)
-    except Exception as e:
-        print(f"错误: 爬虫执行失败: {e}", file=sys.stderr, flush=True)
-        import traceback
-        traceback.print_exc(file=sys.stderr)
-        sys.exit(1)
+        while True:
+            line = sys.stdin.readline(1024 * 1024 + 1)
+            if not line:
+                raise EOFError("收到 stop 前 stdin 已关闭")
+            if len(line.encode("utf-8")) > 1024 * 1024:
+                raise ValueError("命令行超过 1 MiB")
+            command = load_protocol_json(line)
+            request_id = protocol_identifier(command.get("request_id"), "request_id")
+            kind = command.get("type")
+            response = {"request_id": request_id}
+            if kind == "stop":
+                writer.write({"type": "stopped", **response})
+                return
+            scope = "source" if kind == "discover" else "item"
+            deadline = None
+            try:
+                deadline = CommandDeadline(command["deadline_at"], scope)
+                if kind == "discover":
+                    fields = run_before_deadline(
+                        crawler.discover, deadline, command["cursor"], command["limit"],
+                    )
+                    response.update(type="page", **fields)
+                elif kind == "resolve":
+                    fields = run_before_deadline(crawler.resolve, deadline, command["candidate"])
+                    response.update(type="item", **fields)
+                else:
+                    raise ValueError("未知命令类型")
+            except SourceError as error:
+                response.update(type="error", **error.fields)
+            except Exception as error:
+                traceback.print_exc(file=sys.stderr)
+                response.update(
+                    type="error", scope=scope, code="parse_failed",
+                    message=utf8_prefix(str(error), 8192) or "解析失败", retryable=False,
+                )
+            finally:
+                if deadline is not None:
+                    deadline.cancelled.set()
+            writer.write(response)
+    finally:
+        crawler.session.close()
 
 
 def main():
@@ -886,9 +1205,9 @@ def main():
                         help="文件路径，每行一个已处理过的 viewkey 或 mp4 源 ID；脚本会跳过这些视频")
     parser.add_argument("--stream-output", action="store_true",
                         help="流式模式：每解析一条视频直链就立即把它作为一行 JSON 写到 stdout 并 flush；"
-                             "日志改走 stderr。配合 backend 边读边下载使用。")
+                             "日志改走 stderr。项目协议集成请使用 --job。")
     parser.add_argument("--job", type=str, default=None,
-                        help="crawler.v2 job JSON 路径；作为通用脚本爬虫运行。")
+                        help="crawler.v3 job JSON 路径；逐行读取 stdin 命令并响应。")
     parser.add_argument("--category", type=str, default=DEFAULT_CATEGORY,
                         help="分类，默认 top；例如 --category top")
 
@@ -973,5 +1292,7 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except BrokenPipeError:
+    except (BrokenPipeError, KeyboardInterrupt):
+        # 避免解释器退出时再次向已关闭的 stdout 刷新。
+        sys.stdout = open(os.devnull, "w")
         sys.exit(0)
