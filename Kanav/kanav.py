@@ -1,821 +1,530 @@
 #!/usr/bin/env python3
-"""
-KanAV (kanav.ad) Video Crawler
-===============================
-Scrapes video direct URLs (m3u8), titles, cover images, and unique IDs from
-https://kanav.ad without browser automation (pure requests + BeautifulSoup).
+"""Single-file crawler.v3; dependencies: requests, beautifulsoup4 (PySocks for SOCKS proxies)."""
 
-Site notes:
-    - MacCMS v10 based site.
-    - Listing pages: /index.php/vod/show/id/{cat}.html, paginated via
-      /index.php/vod/show/id/{cat}/page/{N}.html (24 videos per page).
-    - The video URL is hidden in the detail page inside a
-      `var player_... = {...}` script with an encrypted "url" field:
-          decode(url) = unquote( base64decode( unquote(url) ) )
-      e.g. "JTY4JTc0JTc0..." -> "https://cdnNN.11yun.space/....m3u8"
+CRAWLER_NAME = "kanav"
+CRAWLER_PROTOCOL = "crawler.v3"
+CRAWLER_FEEDS = '[{"id":"latest","label":"最新自拍","default":true},{"id":"hot","label":"热门"}]'
 
-Usage:
-    python3 kanav.py --job /path/to/job.json
-
-    # For manual testing:
-    python3 kanav.py --url "https://kanav.ad/index.php/vod/play/id/120952/sid/1/nid/1.html"
-"""
+import argparse
+import base64
+import datetime
+import html
+import json
+import os
+import queue
+import re
+import sys
+import threading
+import time
+import traceback
+import unicodedata
+from email.utils import parsedate_to_datetime
+from urllib.parse import parse_qs, quote, unquote, urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
-import json
-import re
-import time
-import os
-import sys
-import argparse
-import base64
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
-from urllib.parse import urljoin, unquote
-
-CRAWLER_NAME = "kanav"
-CRAWLER_PROTOCOL = "crawler.v2"
-
-# ── Configuration ──────────────────────────────────────────────────────────
-
-BASE_URL = "https://kanav.ad"
-DEFAULT_CATEGORY_ID = 22  # "流出自拍" listing (default crawl target)
-VIDEOS_PER_PAGE = 24
-DEFAULT_WORKERS = 5
-REQUEST_TIMEOUT = 30
-DELAY_BETWEEN_PAGES = 0.5
-DELAY_BETWEEN_VIDEOS = 0.3
-MAX_RETRIES = 3
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-}
+from urllib3.util import Timeout
 
 
-def log(msg):
-    """Write a log message to stderr."""
-    print(f"[{CRAWLER_NAME}] {msg}", file=sys.stderr, flush=True)
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
 
 
-def emit(obj):
-    """Write a JSON Lines object to stdout and flush."""
+def utf8_prefix(value, size):
+    return str(value).encode("utf-8")[:size].decode("utf-8", errors="ignore")
+
+
+def identifier(value, name):
+    if (not isinstance(value, str) or not value or value != value.strip()
+            or len(value.encode("utf-8")) > 512
+            or any(unicodedata.category(c) == "Cc" for c in value)):
+        raise ValueError(name + " must be a 1-512 byte identifier")
+    return value
+
+
+def http_url(value):
+    if not isinstance(value, str) or len(value.encode("utf-8")) > 8192:
+        raise ValueError("Invalid HTTP(S) URL")
+    parsed = urlparse(value)
+    if (parsed.scheme not in {"http", "https"} or not parsed.hostname
+            or parsed.username is not None or parsed.password is not None
+            or any(c.isspace() or unicodedata.category(c) == "Cc" for c in value)):
+        raise ValueError("Invalid HTTP(S) URL")
+    parsed.port
+    return value
+
+
+def protocol_headers(headers):
+    if not isinstance(headers, dict) or len(headers) > 64:
+        raise ValueError("headers must be an object with at most 64 entries")
+    for name, value in headers.items():
+        if (not isinstance(name, str) or len(name.encode("utf-8")) > 256
+                or not re.fullmatch(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+", name)
+                or not isinstance(value, str) or len(value.encode("utf-8")) > 8192
+                or any(c in value for c in "\r\n\0")):
+            raise ValueError("Invalid HTTP header")
+    return headers
+
+
+class SourceError(Exception):
+    def __init__(self, scope, code, message, retryable=False, retry_after=None):
+        super().__init__(message)
+        self.fields = dict(scope=scope, code=code,
+                           message=utf8_prefix(message, 8192) or "Request failed",
+                           retryable=bool(retryable))
+        if retry_after is not None:
+            self.fields["retry_after_seconds"] = max(0, min(86400, int(retry_after)))
+
+
+class CommandDeadline:
+    def __init__(self, deadline_at, scope):
+        deadline = datetime.datetime.fromisoformat(deadline_at.replace("Z", "+00:00"))
+        if deadline.tzinfo is None or deadline.utcoffset() is None:
+            raise ValueError("deadline_at must include a timezone")
+        seconds = (deadline - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
+        self.expires_at = time.monotonic() + seconds - 0.05
+        self.scope = scope
+        self.cancelled = threading.Event()
+
+    def remaining(self):
+        value = self.expires_at - time.monotonic()
+        if self.cancelled.is_set() or value <= 0:
+            raise SourceError(self.scope, "source_unavailable", "Command deadline reached", True)
+        return value
+
+
+def run_before_deadline(operation, deadline, *args):
+    # A socket read timeout alone does not bound slow, continuously streaming responses.
+    outcomes = queue.Queue(maxsize=1)
+
+    def execute():
+        try:
+            outcomes.put((operation(*args, deadline), None))
+        except Exception as error:
+            outcomes.put((None, error))
+
+    deadline.remaining()
+    threading.Thread(target=execute, daemon=True).start()
     try:
-        print(json.dumps(obj, ensure_ascii=False), flush=True)
-    except BrokenPipeError:
-        sys.exit(0)
-
-
-def positive_int(value, default=10):
-    try:
-        value = int(value)
-    except (TypeError, ValueError):
-        return default
-    return value if value > 0 else default
-
-
-def deadline_reached(limits, start_mono, last_item_mono, emitted):
-    limits = limits or {}
-    max_runtime = limits.get("max_runtime_seconds")
-    if max_runtime:
-        try:
-            if time.monotonic() - start_mono >= float(max_runtime):
-                return True
-        except (TypeError, ValueError):
-            pass
-    deadline_at = limits.get("deadline_at")
-    if deadline_at:
-        try:
-            text = str(deadline_at).replace("Z", "+00:00")
-            deadline = datetime.fromisoformat(text)
-            if deadline.tzinfo is None:
-                return datetime.utcnow() >= deadline
-            return datetime.now(timezone.utc) >= deadline.astimezone(timezone.utc)
-        except Exception:
-            pass
-    idle = limits.get("candidate_idle_timeout_seconds")
-    if idle:
-        try:
-            anchor = last_item_mono if emitted > 0 else start_mono
-            if time.monotonic() - anchor >= float(idle):
-                return True
-        except (TypeError, ValueError):
-            pass
-    return False
-
-
-# ── HTTP helper ────────────────────────────────────────────────────────────
-
-def create_session(proxies=None):
-    """Create a requests session with headers and optional proxy."""
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    if proxies:
-        session.proxies.update(proxies)
-    return session
-
-
-def fetch_page(session, url, max_retries=MAX_RETRIES):
-    """Fetch a page with retries and exponential backoff."""
-    for attempt in range(max_retries):
-        try:
-            resp = session.get(url, timeout=REQUEST_TIMEOUT)
-            if resp.status_code == 404:
-                # video may have been removed; not worth retrying
-                return resp
-            resp.raise_for_status()
-            resp.encoding = "utf-8"
-            return resp
-        except requests.RequestException as e:
-            if attempt < max_retries - 1:
-                wait = 2 ** attempt
-                time.sleep(wait)
-            else:
-                raise e
-    return None
-
-
-# ── URL decoding (MacCMS player "url" field) ──────────────────────────────
-
-def decode_media_url(enc):
-    """
-    Decode the MacCMS-encrypted video URL.
-
-    The stored value is: percent-encode( base64( percent-encode(url) ) )
-    So decoding is: unquote -> base64decode -> unquote.
-    Multiple sources may be joined by "$$$"; the first one wins.
-    """
-    if not enc:
-        return ""
-    try:
-        step1 = unquote(enc)
-        step2 = base64.b64decode(step1).decode("utf-8")
-        step3 = unquote(step2)
-    except Exception:
-        return ""
-    # keep the first non-empty source
-    for part in re.split(r"\$\$\$", step3):
-        part = part.strip()
-        if re.match(r"^https?://", part):
-            return part
-    return step3.strip()
-
-
-# ── Pagination helper ──────────────────────────────────────────────────────
-
-HOT_LABEL_URL = "/index.php/label/hot.html"
-
-
-def get_total_pages(session, category_id, source="category"):
-    """Get the total number of listing pages from the first page."""
-    if source == "hot":
-        # 热门影片标签页: single page, no real pagination
-        return 1
-    url = f"{BASE_URL}/index.php/vod/show/id/{category_id}.html"
-    resp = fetch_page(session, url)
-    if resp is None:
-        return 1
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    # Last-page link: <li><a class="extend" href=".../page/767.html" title="尾页">
-    pagination_links = soup.select(".pagination a")
-    for link in pagination_links:
-        if link.get("title") == "尾页" or link.text.strip() == "尾页":
-            href = link.get("href", "")
-            match = re.search(r"/page/(\d+)", href)
-            if match:
-                return int(match.group(1))
-
-    # Fallback 1: total videos count hidden in <div class="total">
-    total_div = soup.select_one("div.total")
-    if total_div:
-        try:
-            total = int(total_div.text.strip())
-            return max(1, (total + VIDEOS_PER_PAGE - 1) // VIDEOS_PER_PAGE)
-        except (TypeError, ValueError):
-            pass
-
-    # Fallback 2: largest page number in pagination links
-    max_page = 1
-    for link in pagination_links:
-        href = link.get("href", "")
-        match = re.search(r"/page/(\d+)", href)
-        if match:
-            max_page = max(max_page, int(match.group(1)))
-
-    return max_page
-
-
-# ── Listing page scraper ───────────────────────────────────────────────────
-
-DURATION_RE = re.compile(
-    r"(?:(\d+)\s*小时)?\s*(?:(\d+)\s*分钟)?\s*(?:(\d+)\s*秒)?"
-)
-
-
-def parse_duration(text):
-    """Parse '22分钟 6秒' / '1小时 17分钟 1秒' into seconds."""
-    text = text or ""
-    match = DURATION_RE.search(text)
-    if not match:
-        return None
-    h, m, s = match.groups()
-    if h is None and m is None and s is None:
-        return None
-    return (int(h or 0) * 3600) + (int(m or 0) * 60) + int(s or 0)
-
-
-def scrape_listing_page(session, category_id, page_num, source="category"):
-    """
-    Scrape a single listing page for basic video metadata.
-
-    Returns a list of dicts with keys:
-        vod_id, title, cover_image, duration_seconds, category, page_url
-    """
-    if source == "hot":
-        url = f"{BASE_URL}{HOT_LABEL_URL}"
-    elif page_num == 1:
-        url = f"{BASE_URL}/index.php/vod/show/id/{category_id}.html"
-    else:
-        url = f"{BASE_URL}/index.php/vod/show/id/{category_id}/page/{page_num}.html"
-    resp = fetch_page(session, url)
-    if resp is None:
-        raise RuntimeError(f"failed to fetch listing page {page_num}")
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    videos = []
-    for item in soup.select("div.video-item"):
-        try:
-            # Detail page URL -> extract the native video id
-            link = item.select_one("a[href*='/index.php/vod/play/']")
-            if not link:
-                link = item.find("a")
-            page_url = urljoin(BASE_URL, link.get("href", "")) if link else ""
-            match = re.search(r"/vod/play/id/(\d+)", page_url)
-            vod_id = match.group(1) if match else ""
-
-            # Cover image (data-original, falling back to src)
-            img = item.select_one("img")
-            cover_image = ""
-            if img:
-                cover_image = (
-                    img.get("data-original") or img.get("src") or ""
-                ).strip()
-
-            # Title (img alt first, then .entry-title link text)
-            title = ""
-            if img:
-                title = (img.get("alt") or "").strip()
-            if not title:
-                title_el = item.select_one(".entry-title a")
-                if title_el:
-                    title = title_el.text.strip()
-
-            # Category badge (sometimes holds a view-count like "1229 Views"
-            # when the video has no category)
-            cat_el = item.select_one(".model-view-left")
-            category = cat_el.text.strip() if cat_el else ""
-            if re.match(r"^\d+\s*Views?$", category):
-                category = ""
-
-            # Duration badge
-            dur_el = item.select_one(".model-view")
-            duration_seconds = parse_duration(
-                dur_el.text.strip() if dur_el else ""
-            )
-
-            videos.append({
-                "vod_id": vod_id,
-                "title": title,
-                "cover_image": cover_image,
-                "duration_seconds": duration_seconds,
-                "category": category,
-                "page_url": page_url,
-            })
-        except Exception as e:
-            log(f"WARN: Failed to parse video item on page {page_num}: {e}")
-            continue
-
-    return videos
-
-
-# ── Detail page scraper ────────────────────────────────────────────────────
-
-def scrape_detail_page(session, page_url):
-    """
-    Scrape a single video detail page for the direct m3u8 URL and extras.
-
-    Returns a dict with keys:
-        media_url, actor, published_at, tags
-    """
-    result = {
-        "media_url": "",
-        "actor": "",
-        "published_at": "",
-        "tags": [],
-    }
-
-    try:
-        resp = fetch_page(session, page_url)
-        if resp is None or resp.status_code == 404:
-            log(f"WARN: detail page unavailable (404): {page_url}")
-            return result
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # ── Player script: var player_aaaa = {...} ─────────────────────
-        script = soup.find(
-            "script", string=re.compile(r"var\s+player_\w+\s*=")
-        )
-        if script and script.string:
-            match = re.search(
-                r"var\s+player_\w+\s*=\s*(\{.*\})\s*;?\s*$",
-                script.string, re.S
-            )
-            if match:
-                try:
-                    data = json.loads(match.group(1))
-                except (json.JSONDecodeError, TypeError):
-                    data = {}
-                result["media_url"] = decode_media_url(data.get("url", ""))
-                vod_data = data.get("vod_data") or {}
-                if isinstance(vod_data, dict):
-                    result["actor"] = (vod_data.get("vod_actor") or "").strip()
-                elif isinstance(vod_data, str) and vod_data:
-                    result["actor"] = vod_data.strip()
-
-        # ── Published date: <a class="btn btn-info btn-md">上映日期：2026-08-05</a>
-        for a in soup.select("div.video-countext-categories a.btn-info"):
-            text = a.text.strip()
-            dm = re.search(r"(\d{4}-\d{1,2}-\d{1,2})", text)
-            if dm:
-                result["published_at"] = dm.group(1)
-                break
-
-        # ── Tags: plain links to /index.php/vod/search.html?wd=...
-        for a in soup.select("div.video-countext-tags a"):
-            href = a.get("href", "")
-            if "vod/search.html" in href:
-                tag = a.text.strip()
-                # skip the view-count pseudo-tag like "1229 Views"
-                if tag and not re.match(r"^\d+\s*Views?$", tag):
-                    result["tags"].append(tag)
-
-    except Exception as e:
-        log(f"WARN: Failed to scrape detail page {page_url}: {e}")
-
+        result, error = outcomes.get(timeout=deadline.remaining())
+    except queue.Empty:
+        deadline.cancelled.set()
+        raise SourceError(deadline.scope, "source_unavailable", "Command deadline reached", True)
+    deadline.remaining()
+    if error is not None:
+        raise error
     return result
 
 
-# ── Item builder ───────────────────────────────────────────────────────────
+def retry_after(value):
+    if not value:
+        return None
+    try:
+        return max(0, min(86400, int(value)))
+    except (ValueError, TypeError):
+        try:
+            when = parsedate_to_datetime(value)
+            return max(0, min(86400, int((when - datetime.datetime.now(datetime.timezone.utc)).total_seconds())))
+        except (ValueError, TypeError, OverflowError):
+            return None
 
-def sanitize_source_id(raw):
-    sanitized = re.sub(r"[^a-zA-Z0-9_.-]", "", str(raw or ""))
-    if not re.search(r"[A-Za-z0-9]", sanitized):
+
+def duration_seconds(text):
+    text = str(text or "").strip()
+    if re.fullmatch(r"\d+(?::\d{1,2}){1,2}", text):
+        total = 0
+        for part in text.split(":"):
+            total = total * 60 + int(part)
+        return total if total <= 604800 else None
+    match = re.fullmatch(r"P(?:(\d+)D)?T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?", text)
+    if match:
+        d, h, m, s = match.groups()
+        total = int(float(d or 0) * 86400 + float(h or 0) * 3600 + float(m or 0) * 60 + float(s or 0))
+        return total if total <= 604800 else None
+    h = re.search(r"(\d+)\s*小时", text)
+    m = re.search(r"(\d+)\s*分钟", text)
+    s = re.search(r"(\d+)\s*秒", text)
+    if h or m or s:
+        total = (int(h[1]) * 3600 if h else 0) + (int(m[1]) * 60 if m else 0) + (int(s[1]) if s else 0)
+        return total if total <= 604800 else None
+    return int(text) if text.isdigit() and int(text) <= 604800 else None
+
+
+def meta_value(soup, name):
+    node = soup.find("meta", attrs={"property": name}) or soup.find("meta", attrs={"itemprop": re.compile("^" + re.escape(name) + "$", re.I)})
+    return node.get("content", "").strip() if node else ""
+
+
+def page_metadata(soup):
+    title = meta_value(soup, "og:title")
+    if not title:
+        node = soup.select_one("h1") or soup.select_one("title")
+        title = node.get_text(" ", strip=True) if node else ""
+    return dict(title=title, thumbnail_url=meta_value(soup, "og:image"),
+                duration_seconds=duration_seconds(meta_value(soup, "video:duration") or meta_value(soup, "duration")))
+
+
+def image_url(node, base):
+    if node is None:
         return ""
-    return sanitized[:160]
+    for key in ("data-original", "data-lazy-src", "data-src", "src"):
+        value = node.get(key, "").strip()
+        if value and not value.startswith("data:"):
+            return urljoin(base, value)
+    return ""
 
 
-VIEW_COUNT_RE = re.compile(r"^\d+\s*Views?$")
+class BaseCrawler:
+    def __init__(self, job):
+        self.feed_id = job["feed_id"]
+        self.config = job.get("config", {})
+        self.base_url = http_url(self.config.get("base_url", DEFAULT_BASE_URL)).rstrip("/")
+        self.custom_headers = protocol_headers(self.config.get("headers", {}))
+        self.session = requests.Session()  # requests' default adapter performs no automatic retries.
+        self.session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.9"})
+        self.session.headers.update(self.custom_headers)
+        proxy = job.get("network", {}).get("proxy_url")
+        if proxy:
+            self.session.proxies.update({"http": proxy, "https": proxy})
+        self.pages = {}
+        self.metadata = {}
+        self.state_lock = threading.Lock()
 
+    def fetch_text(self, url, deadline, scope, referer=None, method="GET", headers=None):
+        # Expired operations keep their own Session and cannot commit late cookies or cache entries.
+        with requests.Session() as session:
+            with self.state_lock:
+                deadline.remaining()
+                session.headers.update(self.session.headers)
+                session.cookies.update(self.session.cookies)
+                session.proxies.update(self.session.proxies)
+                session.trust_env = self.session.trust_env
+            request_headers = dict(headers or {})
+            if referer:
+                request_headers["Referer"] = referer
+            for _ in range(11):
+                deadline.remaining()
+                try:
+                    with session.request(method, http_url(url), headers=request_headers,
+                                         data=b"" if method == "POST" else None,
+                                         timeout=Timeout(total=min(30, deadline.remaining())),
+                                         stream=True, allow_redirects=False) as response:
+                        deadline.remaining()
+                        status = response.status_code
+                        if status in {301, 302, 303, 307, 308}:
+                            location = response.headers.get("Location")
+                            if not location:
+                                raise SourceError(scope, "parse_failed", "Redirect has no Location header")
+                            url = http_url(urljoin(url, location))
+                            if status == 303 or (status in {301, 302} and method == "POST"):
+                                method = "GET"
+                            continue
+                        if status >= 400:
+                            code = {401: "auth_required", 403: "auth_required", 404: "not_found",
+                                    410: "not_found", 429: "rate_limited"}.get(status, "source_unavailable")
+                            error_scope = "source" if code in {"auth_required", "rate_limited"} else scope
+                            raise SourceError(error_scope, code, "Source returned HTTP %d" % status,
+                                              code in {"rate_limited", "source_unavailable"},
+                                              retry_after(response.headers.get("Retry-After"))
+                                              if code in {"rate_limited", "source_unavailable"} else None)
+                        chunks, size = [], 0
+                        for chunk in response.iter_content(chunk_size=65536):
+                            deadline.remaining()
+                            size += len(chunk)
+                            if size > 8 * 1024 * 1024:
+                                raise SourceError(scope, "parse_failed", "Source response exceeds 8 MiB")
+                            chunks.append(chunk)
+                        text = b"".join(chunks).decode("utf-8", errors="replace")
+                        if ("cf-chl-" in text and "challenge-platform" in text) or ("Just a moment" in text and len(text) < 8000):
+                            raise SourceError("source", "auth_required", "Source requires browser verification or a valid Cookie")
+                        with self.state_lock:
+                            deadline.remaining()
+                            self.session.cookies.update(session.cookies)
+                        return text
+                except requests.exceptions.RequestException as error:
+                    raise SourceError(scope, "source_unavailable", "Source network request failed", True) from error
+            raise SourceError(scope, "source_unavailable", "Too many source redirects", True)
 
-def build_item(video):
-    """
-    Build a crawler item from listing + detail data.
-
-    Args:
-        video: dict with keys from listing + detail scraping
-
-    Returns:
-        dict suitable for stdout JSON Lines output, or None if invalid
-    """
-    source_id = sanitize_source_id(video.get("vod_id"))
-    title = (video.get("title") or "").strip()
-    media_url = (video.get("media_url") or "").strip()
-    if not source_id or not title or not media_url:
+    def next_page(self, soup, page):
+        base = soup.find("base", href=True)
+        reference = urljoin(self.page_url(page), base["href"]) if base else self.page_url(page)
+        for link in soup.select("a[href]"):
+            if link.get("aria-disabled") == "true" or "disabled" in link.get("class", []):
+                continue
+            address = urlparse(urljoin(reference, link["href"]))
+            if address.hostname != urlparse(self.base_url).hostname:
+                continue
+            number = self.page_number(address)
+            if number is not None and number > page:
+                return page + 1
         return None
 
-    item = {
-        "type": "item",
-        "source_id": source_id,
-        "title": title,
-        "media_url": media_url,
-        "thumbnail_url": (video.get("cover_image") or "").strip(),
-        "detail_url": video.get("page_url", ""),
-        "headers": {
-            "Referer": "https://kanav.ad/",
-            "User-Agent": HEADERS["User-Agent"],
-        },
-    }
-
-    if video.get("actor"):
-        item["author"] = video["actor"]
-
-    if video.get("category"):
-        item["tags"] = [video["category"]]
-    if video.get("tags"):
-        extra = item.get("tags", [])
-        for t in video["tags"]:
-            if t not in extra:
-                extra.append(t)
-        item["tags"] = extra
-    # drop any stray view-count pseudo-tags
-    if item.get("tags"):
-        item["tags"] = [t for t in item["tags"] if not VIEW_COUNT_RE.match(t)]
-        if not item["tags"]:
-            del item["tags"]
-
-    if video.get("duration_seconds"):
-        item["duration_seconds"] = video["duration_seconds"]
-
-    if video.get("published_at"):
-        item["published_at"] = video["published_at"]
-
-    return item
-
-
-# ── Read seen file ─────────────────────────────────────────────────────────
-
-def load_seen_ids(seen_file_path):
-    """
-    Load seen source IDs from a text file (one ID per line).
-
-    Returns a set of source_id strings.
-    """
-    seen = set()
-    if not seen_file_path:
-        return seen
-
-    if not os.path.exists(seen_file_path):
-        log(f"Seen file does not exist yet: {seen_file_path}")
-        return seen
-
-    try:
-        with open(seen_file_path, "r", encoding="utf-8") as f:
-            for line in f:
-                sid = line.strip()
-                if sid:
-                    seen.add(sid)
-        log(f"Loaded {len(seen)} seen IDs from {seen_file_path}")
-    except Exception as e:
-        log(f"WARN: Failed to read seen file: {e}")
-
-    return seen
-
-
-# ── Main job runner ────────────────────────────────────────────────────────
-
-def run_job(job_path):
-    """Run the crawler job from a job.json file."""
-
-    # ── Parse job config ─────────────────────────────────────────────────
-    if not os.path.exists(job_path):
-        log(f"ERROR: job file not found: {job_path}")
-        sys.exit(1)
-
-    try:
-        with open(job_path, "r", encoding="utf-8") as f:
-            job = json.load(f)
-    except Exception as e:
-        log(f"ERROR: failed to read job file: {e}")
-        sys.exit(1)
-
-    if job.get("protocol") != CRAWLER_PROTOCOL:
-        log(f"ERROR: unsupported protocol: {job.get('protocol')!r} "
-            f"(need {CRAWLER_PROTOCOL!r})")
-        sys.exit(1)
-    if job.get("mode") not in ("", None, "crawl"):
-        log(f"ERROR: unsupported mode: {job.get('mode')!r}")
-        sys.exit(1)
-
-    candidate_budget = positive_int(
-        job.get("candidate_budget") or job.get("target_new"),
-        default=10,
-    )
-
-    seen_file = job.get("seen_source_ids_file", "")
-    proxy_url = (job.get("network") or {}).get("proxy_url", "")
-    proxies = None
-    if proxy_url:
-        proxies = {"http": proxy_url, "https": proxy_url}
-        log(f"Using proxy: {proxy_url}")
-
-    # Admin config: optional "source" ("category" or "hot") and
-    # "category_id" (site listing category, default 22 = 流出自拍)
-    config = job.get("config") or {}
-    source = "category"
-    if isinstance(config, dict):
-        source = str(config.get("source", "category") or "category").strip().lower()
-        if source not in ("category", "hot"):
-            log(f"WARN: unknown source {source!r}, falling back to 'category'")
-            source = "category"
-        category_id = positive_int(config.get("category_id"), DEFAULT_CATEGORY_ID)
-    else:
-        category_id = DEFAULT_CATEGORY_ID
-    workers = positive_int(config.get("workers"), DEFAULT_WORKERS) \
-        if isinstance(config, dict) else DEFAULT_WORKERS
-
-    limits = job.get("limits") if isinstance(job.get("limits"), dict) else {}
-    progress_interval = positive_int(
-        limits.get("progress_interval_seconds"), default=60
-    )
-
-    log(f"Job started: source={source}, category_id={category_id}, "
-        f"candidate_budget={candidate_budget}, seen_file={seen_file}, "
-        f"proxy={'yes' if proxy_url else 'no'}")
-
-    # ── Load seen IDs ────────────────────────────────────────────────────
-    seen = load_seen_ids(seen_file)
-
-    # ── Setup ────────────────────────────────────────────────────────────
-    session = create_session(proxies)
-
-    # Auto-detect total pages
-    try:
-        max_pages = get_total_pages(session, category_id, source)
-        log(f"Found {max_pages} listing pages "
-            f"({max_pages * VIDEOS_PER_PAGE} videos estimated)")
-    except Exception as e:
-        log(f"ERROR: Failed to detect total pages: {e}")
-        sys.exit(1)
-
-    # ── Crawl ────────────────────────────────────────────────────────────
-    emitted = 0
-    checked = 0
-    page_num = 1
-    stopped_early = False
-    start_mono = time.monotonic()
-    last_item_mono = start_mono
-    last_progress_mono = start_mono
-
-    detail_lock = threading.Lock()
-
-    def maybe_progress(message=""):
-        nonlocal last_progress_mono
-        now = time.monotonic()
-        if not message and now - last_progress_mono < progress_interval:
-            return
-        emit({
-            "type": "progress",
-            "checked": checked,
-            "emitted": emitted,
-            "message": message or f"checked={checked} emitted={emitted}",
-        })
-        last_progress_mono = now
-
-    for page_num in range(1, max_pages + 1):
-        if emitted >= candidate_budget:
-            stopped_early = True
-            break
-        if deadline_reached(limits, start_mono, last_item_mono, emitted):
-            log("Reached job deadline/limits, stopping")
-            break
-
-        # ── Fetch listing page ─────────────────────────────────────────
-        try:
-            page_videos = scrape_listing_page(session, category_id, page_num, source)
-        except Exception as e:
-            log(f"ERROR: Failed to scrape listing page {page_num}: {e}")
-            maybe_progress(f"Failed listing page {page_num}")
-            if page_num < max_pages:
-                time.sleep(DELAY_BETWEEN_PAGES)
-            continue
-
-        if not page_videos:
-            log(f"Page {page_num}/{max_pages}: empty page, stopping")
-            break
-
-        checked += len(page_videos)
-
-        # ── Filter already-seen videos (by ID from listing URL) ────────
-        unseen = []
-        for v in page_videos:
-            sid = sanitize_source_id(v.get("vod_id"))
-            if sid and sid not in seen:
-                v["vod_id"] = sid
-                unseen.append(v)
-
-        if not unseen:
-            log(f"Page {page_num}/{max_pages}: {len(page_videos)} videos, "
-                f"0 new (all already seen)")
-            maybe_progress(f"Scanned page {page_num}/{max_pages}")
-            if page_num < max_pages:
-                time.sleep(DELAY_BETWEEN_PAGES)
-            continue
-
-        remaining = candidate_budget - emitted
-        if len(unseen) > remaining:
-            unseen = unseen[:remaining]
-
-        log(f"Page {page_num}/{max_pages}: {len(page_videos)} videos, "
-            f"{len(unseen)} new → need detail pages")
-
-        def fetch_and_build(video):
-            detail = scrape_detail_page(session, video["page_url"])
-            video["media_url"] = detail["media_url"]
-            video["actor"] = detail["actor"]
-            video["published_at"] = detail["published_at"]
-            video["tags"] = detail["tags"]
-            time.sleep(DELAY_BETWEEN_VIDEOS)
-            return build_item(video)
-
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            future_to_video = {
-                executor.submit(fetch_and_build, v): v
-                for v in unseen
-            }
-
-            for future in as_completed(future_to_video):
-                if emitted >= candidate_budget:
-                    stopped_early = True
-                    for f in future_to_video:
-                        f.cancel()
-                    break
-                if deadline_reached(limits, start_mono, last_item_mono, emitted):
-                    for f in future_to_video:
-                        f.cancel()
-                    break
-
-                v = future_to_video[future]
-                try:
-                    item = future.result()
-                except Exception as e:
-                    log(f"WARN: Failed detail page for "
-                        f"video {v['vod_id']}: {e}")
+    def discover(self, cursor, limit, deadline):
+        deadline.remaining()
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        if cursor is None:
+            page, offset = 1, 0
+        else:
+            identifier(cursor, "cursor")
+            match = re.fullmatch(r"page:([1-9][0-9]*):(0|[1-9][0-9]*)", cursor)
+            if not match:
+                raise ValueError("Invalid pagination cursor")
+            page, offset = map(int, match.groups())
+        if page not in self.pages:
+            text = self.fetch_text(self.page_url(page), deadline, "source", self.base_url + "/")
+            soup = BeautifulSoup(text, "html.parser")
+            rows = self.parse_listing(soup)
+            if not rows and not (soup.select_one(".no-results, .no-videos, .empty-list")
+                                 or re.search(r"no (?:videos|results|items)|暂无视频|没有视频", soup.get_text(), re.I)):
+                raise SourceError("source", "parse_failed", "Unrecognized video list structure")
+            previous = {key for number, cached in self.pages.items() if number < page for key in cached["keys"]}
+            items, keys = [], set()
+            for row in rows:
+                source_id = identifier(str(row["id"]), "source_id")
+                key = identifier("detail:" + source_id, "discovery_key")
+                if key in keys:
                     continue
+                keys.add(key)
+                if key not in previous:
+                    items.append(dict(discovery_key=key, source_id=source_id,
+                                      locator=dict(id=source_id, detail_url=http_url(row["detail_url"]))))
+            following = self.next_page(soup, page)
+            with self.state_lock:
+                deadline.remaining()
+                self.pages[page] = dict(items=items, keys=keys, next_page=following)
+                for row in rows:
+                    self.metadata.setdefault(str(row["id"]), row)
+        cached = self.pages[page]
+        if offset > len(cached["items"]):
+            raise ValueError("Cursor offset is outside the page")
+        selected = cached["items"][offset:offset + limit]
+        end = offset + len(selected)
+        following = ("page:%d:%d" % (page, end) if end < len(cached["items"])
+                     else "page:%d:0" % cached["next_page"] if cached["next_page"] is not None else None)
+        deadline.remaining()
+        return dict(items=selected, next_cursor=following)
 
-                if not item:
-                    log(f"WARN: Invalid item for video {v['vod_id']}, skip")
-                    continue
+    def media_object(self, url, referer):
+        url = http_url(url)
+        headers = {"User-Agent": self.session.headers["User-Agent"]}
+        if referer:
+            headers["Referer"] = referer
+        headers.update(self.custom_headers)
+        with self.state_lock:
+            prepared = self.session.prepare_request(requests.Request("GET", url, headers=headers))
+        if prepared.headers.get("Cookie"):
+            headers["Cookie"] = prepared.headers["Cookie"]
+        return dict(type="url", url=url, headers=protocol_headers(headers))
 
-                with detail_lock:
-                    if item["source_id"] in seen:
-                        continue
-                    seen.add(item["source_id"])
-                    emit(item)
-                    emitted += 1
-                    last_item_mono = time.monotonic()
-                    last_progress_mono = last_item_mono
-
-        maybe_progress(f"Scanned page {page_num}/{max_pages}")
-
-        if emitted >= candidate_budget:
-            stopped_early = True
-            break
-
-        if page_num < max_pages:
-            time.sleep(DELAY_BETWEEN_PAGES)
-
-    if not stopped_early:
-        page_num = min(page_num, max_pages)
-
-    emit({
-        "type": "done",
-        "stats": {
-            "checked": checked,
-            "emitted": emitted,
-        },
-    })
-
-    log(f"Job complete: checked={checked}, emitted={emitted}, "
-        f"pages={page_num}/{max_pages}")
-
-
-# ── Single-video test mode ─────────────────────────────────────────────────
-
-def scrape_single_video(url):
-    """
-    Scrape a single video by its detail page URL (for testing).
-
-    Outputs one item JSON to stdout.
-    """
-    session = create_session()
-
-    resp = fetch_page(session, url)
-    if resp is None or resp.status_code != 200:
-        log(f"ERROR: failed to fetch {url}")
-        sys.exit(1)
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    match = re.search(r"/vod/play/id/(\d+)", url)
-    vod_id = match.group(1) if match else ""
-
-    # Title
-    title = ""
-    h1 = soup.select_one("h1")
-    if h1:
-        title = h1.text.strip()
-
-    # Cover
-    cover = ""
-    pic_script = soup.find(
-        "script", string=re.compile(r"MacPlayer\.Pic")
-    )
-    if pic_script and pic_script.string:
-        pm = re.search(r'MacPlayer\.Pic="([^"]*)"', pic_script.string)
-        if pm:
-            cover = pm.group(1)
-    if not cover:
-        img = soup.select_one("img.countext-img")
-        if img:
-            cover = img.get("src", "")
-
-    # Player url + actor
-    media_url = ""
-    actor = ""
-    player_script = soup.find(
-        "script", string=re.compile(r"var\s+player_\w+\s*=")
-    )
-    if player_script and player_script.string:
-        pm = re.search(r"var\s+player_\w+\s*=\s*(\{.*\})\s*;?\s*$",
-                       player_script.string, re.S)
-        if pm:
-            try:
-                data = json.loads(pm.group(1))
-                media_url = decode_media_url(data.get("url", ""))
-                vod_data = data.get("vod_data") or {}
-                if isinstance(vod_data, dict):
-                    actor = (vod_data.get("vod_actor") or "").strip()
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-    # Published date
-    published_at = ""
-    for a in soup.select("div.video-countext-categories a.btn-info"):
-        dm = re.search(r"(\d{4}-\d{1,2}-\d{1,2})", a.text)
-        if dm:
-            published_at = dm.group(1)
-            break
-
-    video = {
-        "vod_id": vod_id,
-        "title": title,
-        "media_url": media_url,
-        "cover_image": cover,
-        "actor": actor,
-        "published_at": published_at,
-        "tags": [],
-        "category": "",
-        "duration_seconds": None,
-        "page_url": url,
-    }
-
-    item = build_item(video)
-    if not item:
-        log("ERROR: could not build valid item from page")
-        sys.exit(1)
-    emit(item)
-    return item
+    def resolve(self, candidate, deadline):
+        deadline.remaining()
+        key = identifier(candidate["discovery_key"], "discovery_key")
+        locator = candidate["locator"]
+        if not isinstance(locator, dict) or len(json.dumps(locator, ensure_ascii=False).encode("utf-8")) > 16384:
+            raise ValueError("locator must be an object of at most 16 KiB")
+        source_id = identifier(candidate.get("source_id", locator["id"]), "source_id")
+        if source_id != identifier(locator["id"], "locator.id"):
+            raise ValueError("Candidate source_id does not match locator.id")
+        detail = http_url(locator["detail_url"])
+        data = self.resolve_detail(source_id, detail, deadline)
+        row = self.metadata.get(source_id, {})
+        title = utf8_prefix(str(data.get("title") or row.get("title") or "").strip(), 4096)
+        if not title or not data.get("media_url"):
+            raise SourceError("item", "parse_failed", "Missing video title or playable media URL")
+        result = dict(discovery_key=key, source_id=source_id, title=title, detail_url=detail,
+                      media=self.media_object(urljoin(detail, data["media_url"]), data.get("media_referer", detail)))
+        thumbnail = data.get("thumbnail_url") or row.get("thumbnail_url")
+        if thumbnail:
+            result["thumbnail"] = self.media_object(urljoin(detail, thumbnail), data.get("thumbnail_referer", detail))
+        for field, size in (("author", 1024), ("description", 65536)):
+            value = str(data.get(field) or row.get(field) or "").strip()
+            if value:
+                result[field] = utf8_prefix(value, size)
+        duration = data.get("duration_seconds")
+        if duration is None:
+            duration = row.get("duration_seconds")
+        if type(duration) is int and 0 <= duration <= 604800:
+            result["duration_seconds"] = duration
+        # Site tags cannot create project tags. Only explicitly supplied existing names are eligible.
+        existing = self.config.get("existing_tags", [])
+        if isinstance(existing, list):
+            tags = list(dict.fromkeys(t for t in data.get("tags", []) if isinstance(t, str)
+                                     and t.strip() and t in existing and len(t.encode("utf-8")) <= 256))[:100]
+            if tags:
+                result["tags"] = tags
+        deadline.remaining()
+        return result
 
 
-# ── CLI ─────────────────────────────────────────────────────────────────────
+def unique_keys(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("Duplicate JSON key: " + key)
+        value[key] = item
+    return value
+
+
+def load_json(text):
+    def reject_constant(value):
+        raise ValueError("Invalid JSON constant: " + value)
+    value = json.loads(text, object_pairs_hook=unique_keys, parse_constant=reject_constant)
+    if not isinstance(value, dict):
+        raise ValueError("JSON must be an object")
+    return value
+
+
+class ProtocolWriter:
+    def __init__(self):
+        self.total_bytes = 0
+
+    def write(self, response):
+        line = json.dumps(response, ensure_ascii=False, separators=(",", ":"), allow_nan=False) + "\n"
+        size = len(line.encode("utf-8"))
+        if size > 1024 * 1024 or self.total_bytes + size > 64 * 1024 * 1024:
+            raise ValueError("Protocol output size limit reached")
+        sys.stdout.write(line)
+        sys.stdout.flush()
+        self.total_bytes += size
+
 
 def main():
-    parser = argparse.ArgumentParser(
-        description=f"{CRAWLER_NAME} - KanAV (kanav.ad) Video Crawler",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "--job", "-j",
-        type=str,
-        default=None,
-        help="Path to job.json for crawler orchestration",
-    )
-    parser.add_argument(
-        "--url", "-u",
-        type=str,
-        default=None,
-        help="Scrape a single video by its detail page URL (test mode)",
-    )
-
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+    parser = argparse.ArgumentParser(description=CRAWLER_NAME + " crawler.v3")
+    parser.add_argument("--job", required=True)
     args = parser.parse_args()
+    with open(args.job, encoding="utf-8") as file:
+        job = load_json(file.read())
+    if job.get("protocol") != CRAWLER_PROTOCOL:
+        raise ValueError("Unsupported protocol")
+    if job.get("feed_id") not in {f["id"] for f in json.loads(CRAWLER_FEEDS)}:
+        raise ValueError("Unsupported feed_id")
+    for field in ("task_id", "crawler_id"):
+        if not isinstance(job.get(field), str) or not job[field].strip():
+            raise ValueError(field + " must be a nonempty string")
+    if not isinstance(job.get("work_dir"), str) or not os.path.isabs(job["work_dir"]):
+        raise ValueError("work_dir must be an absolute path")
+    for field in ("config", "network"):
+        job.setdefault(field, {})
+        if not isinstance(job[field], dict):
+            raise ValueError(field + " must be an object")
+    proxy = job["network"].get("proxy_url")
+    if proxy is not None and (not isinstance(proxy, str) or not proxy.strip()):
+        raise ValueError("network.proxy_url must be a nonempty string")
+    if proxy:
+        for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+            os.environ[name] = proxy
+        os.environ["NO_PROXY"] = os.environ["no_proxy"] = ""
+    crawler = Crawler(job)
+    writer = ProtocolWriter()
+    try:
+        while True:
+            line = sys.stdin.readline(1024 * 1024 + 1)
+            if not line:
+                raise EOFError("stdin closed before stop")
+            if len(line.encode("utf-8")) > 1024 * 1024:
+                raise ValueError("Command exceeds 1 MiB")
+            command = load_json(line)
+            request_id = identifier(command.get("request_id"), "request_id")
+            kind = command.get("type")
+            response = dict(request_id=request_id)
+            if kind == "stop":
+                writer.write(dict(type="stopped", **response))
+                return
+            scope = "source" if kind == "discover" else "item"
+            deadline = None
+            try:
+                deadline = CommandDeadline(command["deadline_at"], scope)
+                if kind == "discover":
+                    fields = run_before_deadline(crawler.discover, deadline, command["cursor"], command["limit"])
+                    response.update(type="page", **fields)
+                elif kind == "resolve":
+                    fields = run_before_deadline(crawler.resolve, deadline, command["candidate"])
+                    response.update(type="item", **fields)
+                else:
+                    raise ValueError("Unknown command type")
+            except SourceError as error:
+                response.update(type="error", **error.fields)
+            except Exception as error:
+                traceback.print_exc(file=sys.stderr)
+                response.update(type="error", scope=scope, code="parse_failed",
+                                message=utf8_prefix(error, 8192) or "Parse failed", retryable=False)
+            finally:
+                if deadline is not None:
+                    deadline.cancelled.set()
+            writer.write(response)
+    finally:
+        crawler.session.close()
 
-    if args.job:
-        run_job(args.job)
-    elif args.url:
-        log(f"Test mode: scraping single video {args.url}")
-        scrape_single_video(args.url)
-    else:
-        parser.print_help()
-        print(
-            "\n[ERROR] Specify --job (job.json) or --url (test mode)",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+
+
+DEFAULT_BASE_URL = "https://kanav.ad"
+
+
+class Crawler(BaseCrawler):
+    def __init__(self, job):
+        super().__init__(job)
+        category = str(self.config.get("category_id", 22))
+        if not category.isdigit() or int(category) < 1:
+            raise ValueError("config.category_id must be a positive integer")
+        self.category_id = str(int(category))
+
+    def page_url(self, page):
+        if self.feed_id == "hot":
+            return self.base_url + "/index.php/label/hot.html"
+        suffix = "/page/%d" % page if page > 1 else ""
+        return self.base_url + "/index.php/vod/show/id/" + self.category_id + suffix + ".html"
+
+    def page_number(self, address):
+        if self.feed_id == "hot":
+            return None
+        match = re.fullmatch(r"/index.php/vod/show/id/" + self.category_id + r"/page/(\d+)\.html", address.path)
+        return int(match[1]) if match else None
+
+    def parse_listing(self, soup):
+        rows = []
+        for card in soup.select("div.video-item"):
+            link = card.find("a", href=re.compile(r"/vod/play/id/\d+"))
+            if not link:
+                continue
+            source_id = re.search(r"/vod/play/id/(\d+)", link["href"])[1]
+            image = card.find("img")
+            duration = card.select_one(".model-view")
+            rows.append(dict(id=source_id, detail_url=urljoin(self.base_url, link["href"]),
+                             title=image.get("alt", "") if image else link.get_text(" ", strip=True),
+                             thumbnail_url=image_url(image, self.base_url),
+                             duration_seconds=duration_seconds(duration.get_text(strip=True)) if duration else None))
+        return rows
+
+    def resolve_detail(self, source_id, detail, deadline):
+        text = self.fetch_text(detail, deadline, "item", self.base_url + "/")
+        soup = BeautifulSoup(text, "html.parser")
+        result = page_metadata(soup)
+        match = re.search(r"\bvar\s+player_\w+\s*=\s*(\{)", text)
+        if not match:
+            raise SourceError("item", "parse_failed", "MacCMS player configuration not found")
+        player, _ = json.JSONDecoder().raw_decode(text[match.start(1):])
+        if player.get("id") and str(player["id"]) != source_id:
+            raise SourceError("item", "parse_failed", "Player does not match the requested video")
+        media = player.get("url", "")
+        encryption = int(player.get("encrypt", 0))
+        if encryption == 2:
+            media = unquote(base64.b64decode(unquote(media)).decode("utf-8"))
+        elif encryption == 1:
+            media = unquote(media)
+        result["media_url"] = urljoin(detail, media.split("$$$")[0].strip()) if media else ""
+        vod = player.get("vod_data", {})
+        if isinstance(vod, dict):
+            result["title"] = vod.get("vod_name") or result["title"]
+            result["author"] = vod.get("vod_actor", "")
+        result["thumbnail_referer"] = ""
+        return result
 
 
 if __name__ == "__main__":
     try:
         main()
-    except KeyboardInterrupt:
-        log("Interrupted by user")
-        sys.exit(0)
-    except BrokenPipeError:
-        # stdout closed by reader - exit silently
-        sys.exit(0)
+    except (KeyboardInterrupt, BrokenPipeError):
+        os._exit(0)

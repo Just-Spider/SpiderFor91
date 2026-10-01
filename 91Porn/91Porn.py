@@ -818,9 +818,6 @@ class Porn91ProtocolCrawler:
         self.base_url = http_url(config.get("base_url", "https://www.91porn.com")).rstrip("/") + "/"
         self.list_url = urljoin(self.base_url, "v.php")
         self.custom_headers = protocol_headers(config.get("headers", {}))
-        self.max_pages = config.get("max_pages")
-        if self.max_pages is not None and (type(self.max_pages) is not int or self.max_pages < 1):
-            raise ValueError("config.max_pages 必须是正整数")
         self.spider = Porn91Spider(
             resume=False, quiet=True, stream_output=True,
             category=self.category, automatic_retries=False,
@@ -881,7 +878,7 @@ class Porn91ProtocolCrawler:
                                     404: "not_found", 410: "not_found",
                                     429: "rate_limited"}.get(status, "source_unavailable")
                             error_scope = "source" if code in {
-                                "auth_required", "rate_limited", "source_unavailable",
+                                "auth_required", "rate_limited",
                             } else scope
                             raise SourceError(
                                 error_scope, code, f"源站返回 HTTP {status}",
@@ -903,8 +900,8 @@ class Porn91ProtocolCrawler:
                         self.session.cookies.update(session.cookies)
                         return text
                 except requests.exceptions.RequestException as error:
-                    raise SourceError("source", "source_unavailable", "源站网络请求失败", True) from error
-            raise SourceError("source", "source_unavailable", "源站重定向次数过多", True)
+                    raise SourceError(scope, "source_unavailable", "源站网络请求失败", True) from error
+            raise SourceError(scope, "source_unavailable", "源站重定向次数过多", True)
 
     @staticmethod
     def check_page(text):
@@ -917,8 +914,6 @@ class Porn91ProtocolCrawler:
             raise SourceError("source", "auth_required", "源站要求登录或登录已失效")
 
     def next_page(self, text, page):
-        if self.max_pages is not None and page >= self.max_pages:
-            return None
         soup = BeautifulSoup(text, "lxml")
         later_pages = []
         for link in soup.select("a[href]"):
@@ -976,7 +971,7 @@ class Porn91ProtocolCrawler:
                     "discovery_key": key, "source_id": viewkey,
                     "locator": {"viewkey": viewkey},
                 })
-            following = self.next_page(text, page) if items else None
+            following = self.next_page(text, page)
             deadline.remaining()
             self.pages[page] = {"items": items, "keys": keys, "next_page": following}
             for row in rows:
